@@ -64,7 +64,7 @@ for key in images:
 
 # Zoom and panning variables
 zoom_level = 1.0
-min_zoom = 0.5
+min_zoom = 0.25
 max_zoom = 2.0
 pan_offset = [0, 0]
 dragging = False
