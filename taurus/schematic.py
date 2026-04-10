@@ -1,352 +1,700 @@
-import xml.etree.ElementTree as ET
-import os
-import re
+"""
+Taurus Schematic – KiCad-native backend with Eagle fallback.
+
+Public API:
+    Schematic: init_libraries, init_device_set, init_device, add_instance, wire_up, save, load
+    Instance:  wire(pin, target_instance, target_pin)
+    Symbol / Descriptor: hierarchical symbol helpers
+"""
+from __future__ import annotations
+
 import math
+import os
+import uuid
+import xml.etree.ElementTree as ET
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from .eaglepy.eagle import (
-    attributes, Eagle, Drawing, Grid, Schematic as EagleSchematic, Sheet, Net, 
-    Part as EaglePart, Library, Device_Set, Device, Connect, Symbol as EagleSymbol, 
-    Segment, Instance as EagleInstance, Gate
-)
-from .eaglepy import default_layers
-from .eaglepy.primitives import Wire, Text, Pin, Rectangle, Circle, Pin_Ref as PinRef
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-class Instance:
-    def __init__(self, eagle_instance, schematic, part_name, device_set, prefix):
-        self.eagle_instance = eagle_instance
-        self.schematic = schematic
-        self.connections = {}  # {"pin_name": (target_instance, target_pin)}
-        self.device_set = device_set
-        self.part = part_name
-        self.prefix = prefix
+from . import sexp as S
 
-    def wire(self, pin_name, target_instance, target_pin):
-        self.connections[pin_name] = (target_instance, target_pin)
+# ---------------------------------------------------------------------------
+#  Constants
+# ---------------------------------------------------------------------------
+KICAD_SCHEMATIC_VERSION = "20250114"
+DEFAULT_KICAD_SHARED = Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport")
 
-    def __getitem__(self, pin_name):
-        return PinRef(part=self.eagle_instance.part.name, gate="G$1", pin=pin_name)
+SUPPORTED_LIBRARY_ALIASES = {
+    "transistor-npn": {"prefixes": {"Q"}},
+    "resistor-power": {"prefixes": {"R"}},
+}
+REQUIRED_LIBRARY_ALIAS = {"Q": "transistor-npn", "R": "resistor-power"}
 
-def get_pins_from_symbol(symbol):
-    pins = []
-    for item in symbol.items:
-        if isinstance(item, Pin):
-            pins.append({
-                'name': item.name,
-                'x': item.x,
-                'y': item.y,
-                'direction': item.direction,
-                'visible': item.visible,
-                'length': item.length
-            })
-    return pins
+# ---------------------------------------------------------------------------
+#  KiCad symbol specs – positions in **schematic** coords (Y-down)
+#  Library .kicad_sym files use Y-up; we negate Y and swap 90/270.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class KiCadSymbolSpec:
+    library_id: str
+    library_file: str
+    symbol_name: str
+    description: str
+    pin_order: Tuple[str, ...]
+    pin_positions: Dict[str, Tuple[float, float]]  # schematic Y-down
+    pin_orientations: Dict[str, int]                # schematic orientations
+    reference_offset: Tuple[float, float, int]      # schematic Y-down
+    value_offset: Tuple[float, float, int]
 
-def compute_absolute_position(instance_x, instance_y, rotation, pin_x, pin_y):
-    rotation_str = str(rotation)
-    if rotation_str == 'R0':
-        return (instance_x + pin_x, instance_y + pin_y)
-    elif rotation_str == 'R90':
-        return (instance_x + pin_y, instance_y - pin_x)
-    elif rotation_str == 'R180':
-        return (instance_x - pin_x, instance_y - pin_y)
-    elif rotation_str == 'R270':
-        return (instance_x - pin_y, instance_y + pin_x)
-    else:
-        return (instance_x + pin_x, instance_y + pin_y)
 
-def organize_components(instances, x_spacing=20, y_spacing=20, padding=5):
-    resistors = [i for i in instances if i.part.name.startswith("R")]
-    transistors = [i for i in instances if i.part.name.startswith("Q")]
-    
-    x, y = padding, padding
-    for res in resistors:
-        res.x, res.y = x, y
-        x += x_spacing * 2
-    
-    x, y = padding, y + y_spacing * 2
-    for trans in transistors:
-        trans.x, trans.y = x, y
-        x += x_spacing * 2
-    
-    all_x = [i.x for i in instances]
-    all_y = [i.y for i in instances]
-    return {
-        "width": max(all_x) - min(all_x) + padding*2,
-        "height": max(all_y) - min(all_y) + padding*2,
-        "x": min(all_x) - padding,
-        "y": min(all_y) - padding
-    }
+SYMBOL_SPECS: Dict[str, KiCadSymbolSpec] = {
+    "Q": KiCadSymbolSpec(
+        library_id="Device:Q_NPN",
+        library_file="Device.kicad_sym",
+        symbol_name="Q_NPN",
+        description="NPN bipolar junction transistor",
+        pin_order=("B", "C", "E"),
+        pin_positions={
+            "B": (-5.08, 0.0),   # base: left
+            "C": (2.54, -5.08),  # collector: top  (lib Y=5.08 → sch Y=-5.08)
+            "E": (2.54, 5.08),   # emitter: bottom (lib Y=-5.08 → sch Y=5.08)
+        },
+        pin_orientations={
+            "B": 0,    # pin extends right → outward left
+            "C": 90,   # pin extends down  → outward up   (lib 270→sch 90)
+            "E": 270,  # pin extends up    → outward down  (lib 90→sch 270)
+        },
+        reference_offset=(5.08, -1.27, 0),
+        value_offset=(5.08, 1.27, 0),
+    ),
+    "R": KiCadSymbolSpec(
+        library_id="Device:R",
+        library_file="Device.kicad_sym",
+        symbol_name="R",
+        description="Resistor",
+        pin_order=("1", "2"),
+        pin_positions={
+            "1": (0.0, -3.81),  # top pin  (lib Y=3.81 → sch Y=-3.81)
+            "2": (0.0, 3.81),   # bottom pin (lib Y=-3.81 → sch Y=3.81)
+        },
+        pin_orientations={
+            "1": 90,   # pin down → outward up  (lib 270→sch 90)
+            "2": 270,  # pin up   → outward down (lib 90→sch 270)
+        },
+        reference_offset=(2.032, 0.0, 90),
+        value_offset=(0.0, 0.0, 90),
+    ),
+}
 
-def compute_symbol_bbox(symbol):
-    min_x, min_y, max_x, max_y = float('inf'), float('inf'), -float('inf'), -float('inf')
-    for item in symbol.items:
-        if isinstance(item, Wire) or isinstance(item, Rectangle):
-            min_x = min(min_x, item.x1, item.x2)
-            min_y = min(min_y, item.y1, item.y2)
-            max_x = max(max_x, item.x1, item.x2)
-            max_y = max(max_y, item.y1, item.y2)
-        elif isinstance(item, Circle):
-            min_x = min(min_x, item.x - item.radius)
-            min_y = min(min_y, item.y - item.radius)
-            max_x = max(max_x, item.x + item.radius)
-            max_y = max(max_y, item.y + item.radius)
-    return (min_x, min_y, max_x, max_y)
+# ---------------------------------------------------------------------------
+#  Geometry helpers
+# ---------------------------------------------------------------------------
+def _fc(v: float) -> str:
+    s = f"{v:.4f}".rstrip("0").rstrip(".")
+    return s or "0"
 
-def compute_instance_bbox(instance):
-    symbol = instance.gate.symbol
-    sym_min_x, sym_min_y, sym_max_x, sym_max_y = compute_symbol_bbox(symbol)
-    rotation = math.radians(instance.rotation.angle)
-    cos_rot, sin_rot = math.cos(rotation), math.sin(rotation)
-    corners = [
-        (sym_min_x, sym_min_y), (sym_min_x, sym_max_y),
-        (sym_max_x, sym_max_y), (sym_max_x, sym_min_y)
-    ]
-    rotated_corners = [
-        (cx * cos_rot - cy * sin_rot, cx * sin_rot + cy * cos_rot)
-        for cx, cy in corners
-    ]
-    translated_corners = [(rx + instance.x, ry + instance.y) for rx, ry in rotated_corners]
-    min_x = min(c[0] for c in translated_corners)
-    min_y = min(c[1] for c in translated_corners)
-    max_x = max(c[0] for c in translated_corners)
-    max_y = max(c[1] for c in translated_corners)
-    return (min_x, min_y, max_x, max_y)
 
+def _uid(*parts: object) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "taurus::" + "::".join(str(p) for p in parts)))
+
+
+def _rot(pt: Tuple[float, float], deg: int) -> Tuple[float, float]:
+    x, y = pt
+    d = deg % 360
+    if d == 0:   return (x, y)
+    if d == 90:  return (y, -x)
+    if d == 180: return (-x, -y)
+    if d == 270: return (-y, x)
+    raise ValueError(deg)
+
+
+def _outward(orientation: int) -> Tuple[float, float]:
+    d = orientation % 360
+    if d == 0:   return (-1.0, 0.0)
+    if d == 90:  return (0.0, -1.0)
+    if d == 180: return (1.0, 0.0)
+    if d == 270: return (0.0, 1.0)
+    raise ValueError(orientation)
+
+
+# ---------------------------------------------------------------------------
+#  Internal data model
+# ---------------------------------------------------------------------------
 class UnionFind:
     def __init__(self):
-        self.parent = {}
+        self.parent: dict = {}
 
     def find(self, x):
         if x not in self.parent:
             self.parent[x] = x
-        if self.parent[x] != x:
+        while self.parent[x] != x:
             self.parent[x] = self.parent[self.parent[x]]
             x = self.parent[x]
         return x
 
-    def union(self, x, y):
-        self.parent[self.find(x)] = self.find(y)
+    def union(self, a, b):
+        self.parent[self.find(a)] = self.find(b)
 
-class Schematic:
-    def __init__(self):
-        self.grid = Grid(distance=0.1, unit_dist="inch", unit="inch", style="lines", multiple=1, display=False)
-        self.layers = default_layers.get_layers()
-        self.sheet = Sheet()
-        self.eagle_schematic = EagleSchematic(sheets=[self.sheet])
-        self.drawing = Drawing(grid=self.grid, layers=self.layers, document=self.eagle_schematic)
-        self.libraries = {}
-        self.device_sets = {}
-        self.devices = {}
-        self.parts = {}
-        self.instances = []
-        self.part_counters = {}
 
-    def _parse_rc_file(self):
-        rc_path = os.path.expanduser("~/Library/Application Support/Eagle/lbr/libraries.rc")
-        library_paths = {}
-        with open(rc_path, 'r') as f:
-            for line in f:
-                m = re.match(r'Lbr\.Managed\.(\d+)\.path\s*=\s*"(.+)"', line)
-                if m:
-                    library_paths[m.group(1)] = m.group(2)
-        return library_paths
+@dataclass
+class Device:
+    name: str
+    package: Optional[str] = None
 
-    def _find_library_path(self, name):
-        lib_paths = self._parse_rc_file().values()
-        for path in lib_paths:
-            if name.lower() in path.lower():
-                return path
-        raise ValueError(f"Library {name} not found")
 
-    def _parse_symbol(self, lbr_path, symbol_name):
-        tree = ET.parse(lbr_path)
-        root = tree.getroot()
-        for symbol_elem in root.findall(".//symbol"):
-            if symbol_elem.attrib.get("name") == symbol_name:
-                items = []
-                for wire_elem in symbol_elem.findall(".//wire"):
-                    items.append(Wire(
-                        x1=float(wire_elem.attrib["x1"]),
-                        y1=float(wire_elem.attrib["y1"]),
-                        x2=float(wire_elem.attrib["x2"]),
-                        y2=float(wire_elem.attrib["y2"]),
-                        width=float(wire_elem.attrib["width"]),
-                        layer=int(wire_elem.attrib["layer"])
-                    ))
-                for pin_elem in symbol_elem.findall(".//pin"):
-                    items.append(Pin(
-                        name=pin_elem.attrib["name"],
-                        x=float(pin_elem.attrib["x"]),
-                        y=float(pin_elem.attrib["y"]),
-                        visible=pin_elem.attrib.get("visible", "off"),
-                        length=pin_elem.attrib.get("length", "short"),
-                        direction=pin_elem.attrib.get("direction", "pas"),
-                        rotation=attributes.ATTR_ROT.parse(pin_elem.attrib.get("rot", "R0"))
-                    ))
-                symbol = EagleSymbol(name=symbol_name, items=items)
-                symbol.bounding_box = compute_symbol_bbox(symbol)
-                return symbol
+@dataclass
+class DeviceSet:
+    name: str
+    prefix: str
+    symbol_spec: KiCadSymbolSpec
+    devices: Dict[str, Device] = field(default_factory=dict)
 
-    def init_libraries(self, *names):
-        for name in names:
-            path = self._find_library_path(name)
-            lib = Library(name=name)
-            self.libraries[name] = lib
-            self.eagle_schematic.libraries.append(lib)
 
-    def init_device_set(self, name, prefix):
-        if prefix == 'Q':
-            lib_name, symbol_name = 'transistor-npn', 'NPN'
-        elif prefix == 'R':
-            lib_name, symbol_name = 'resistor-power', 'R'
+@dataclass
+class PlacedPart:
+    reference: str
+    device_set: DeviceSet
+    device: Device
+    prefix: str
+    x: float = 0.0
+    y: float = 0.0
+    rotation: int = 0
+
+
+class Instance:
+    def __init__(self, component: PlacedPart, schematic: "Schematic",
+                 part_name: str, device_set: str, prefix: str):
+        self.component = component
+        self.schematic = schematic
+        self.connections: Dict[str, Tuple["Instance", str]] = {}
+        self.device_set = device_set
+        self.part = part_name
+        self.prefix = prefix
+
+    def wire(self, pin_name: str, target: "Instance", target_pin: str):
+        self.connections[pin_name] = (target, target_pin)
+
+    def __getitem__(self, pin_name: str):
+        return (self.component.reference, pin_name)
+
+
+# ---------------------------------------------------------------------------
+#  Routing engine
+# ---------------------------------------------------------------------------
+class _Router:
+    def __init__(self, schematic: "Schematic"):
+        self.sch = schematic
+        self.nets: List[Tuple[str, Set[Tuple[str, str]]]] = []
+        self.wires: List[Tuple[float, float, float, float]] = []
+        self.labels: List[Tuple[str, float, float, int, str]] = []
+
+    def run(self):
+        self._build_nets()
+        self._route()
+
+    def _build_nets(self):
+        uf = UnionFind()
+        nodes: Set[Tuple[str, str]] = set()
+        for inst in self.sch.instances:
+            for pin, (tgt, tgt_pin) in inst.connections.items():
+                a = (inst.component.reference, pin)
+                b = (tgt.component.reference, tgt_pin)
+                uf.union(a, b)
+                nodes |= {a, b}
+        groups: Dict[object, Set[Tuple[str, str]]] = defaultdict(set)
+        for n in nodes:
+            groups[uf.find(n)].add(n)
+        self.nets = []
+        for idx, members in enumerate(sorted(sorted(g) for g in groups.values()), 1):
+            self.nets.append((f"N{idx}", set(members)))
+
+    def _pin_pos(self, ref: str, pin: str) -> Tuple[float, float]:
+        comp = self.sch.parts[ref]
+        spec = comp.device_set.symbol_spec
+        px, py = spec.pin_positions[pin]
+        rx, ry = _rot((px, py), comp.rotation)
+        return comp.x + rx, comp.y + ry
+
+    def _pin_orient(self, ref: str, pin: str) -> int:
+        comp = self.sch.parts[ref]
+        spec = comp.device_set.symbol_spec
+        return (spec.pin_orientations[pin] + comp.rotation) % 360
+
+    def _route(self):
+        stub = 2.54
+        for net_name, members in self.nets:
+            member_list = sorted(members)
+            if len(member_list) == 2:
+                a, b = member_list
+                ax, ay = self._pin_pos(*a)
+                bx, by = self._pin_pos(*b)
+                ao, bo = self._pin_orient(*a), self._pin_orient(*b)
+                adx, ady = _outward(ao)
+                bdx, bdy = _outward(bo)
+                aex, aey = ax + adx * stub, ay + ady * stub
+                bex, bey = bx + bdx * stub, by + bdy * stub
+                dist = abs(aex - bex) + abs(aey - bey)
+                if dist < 150:
+                    self.wires.append((ax, ay, aex, aey))
+                    self.wires.append((bx, by, bex, bey))
+                    mx = (aex + bex) / 2.0
+                    # route: stub-a → mid-x → mid-y → stub-b
+                    self.wires.append((aex, aey, mx, aey))
+                    self.wires.append((mx, aey, mx, bey))
+                    self.wires.append((mx, bey, bex, bey))
+                    continue
+
+            # Fallback: net labels for multi-pin nets or long distances
+            for ref, pin in member_list:
+                px, py = self._pin_pos(ref, pin)
+                orient = self._pin_orient(ref, pin)
+                dx, dy = _outward(orient)
+                lx, ly = px + dx * stub, py + dy * stub
+                if dx > 0:
+                    rot, jst = 180, "right bottom"
+                elif dx < 0:
+                    rot, jst = 0, "left bottom"
+                elif dy < 0:
+                    rot, jst = 90, "left bottom"
+                else:
+                    rot, jst = 270, "right bottom"
+                self.wires.append((px, py, lx, ly))
+                self.labels.append((net_name, lx, ly, rot, jst))
+
+
+# ---------------------------------------------------------------------------
+#  Layout engine
+# ---------------------------------------------------------------------------
+def _snap(v: float, grid: float = 1.27) -> float:
+    return round(v / grid) * grid
+
+
+def _layout(instances: List[Instance]):
+    margin = _snap(30.48)    # 24 × 1.27
+    gap = _snap(25.4)        # 20 × 1.27
+    columns = 8
+    y_cursor = margin
+
+    for prefix in ("R", "Q"):
+        group = sorted(
+            [i for i in instances if i.prefix == prefix],
+            key=lambda i: int(i.component.reference[1:]),
+        )
+        if not group:
+            continue
+        cell_w = _snap(20.32) if prefix == "R" else _snap(25.4)   # 16 / 20 grid units
+        cell_h = _snap(20.32) if prefix == "R" else _snap(25.4)
+        for idx, inst in enumerate(group):
+            col = idx % columns
+            row = idx // columns
+            inst.component.x = _snap(margin + col * cell_w)
+            inst.component.y = _snap(y_cursor + row * cell_h)
+        rows = (len(group) - 1) // columns + 1
+        y_cursor = _snap(y_cursor + rows * cell_h + gap)
+
+
+# ---------------------------------------------------------------------------
+#  Extract one top-level symbol block from a .kicad_sym file
+# ---------------------------------------------------------------------------
+def _extract_sym_block(text: str, token: str) -> str:
+    start = text.find(token)
+    if start == -1:
+        raise ValueError(token)
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == "\\" and i + 1 < len(text):
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
         else:
-            raise ValueError(f"Unsupported prefix {prefix}")
-        lib = self.libraries.get(lib_name)
-        if not lib:
-            raise ValueError(f"Library {lib_name} not initialized")
-        lbr_path = self._find_library_path(lib_name)
-        symbol = self._parse_symbol(lbr_path, symbol_name)
-        ds = Device_Set(name=name, prefix=prefix, gates=[Gate(name="G$1", symbol=symbol, x=0, y=0)])
-        lib.device_sets.append(ds)
-        lib.symbols.append(symbol)
+            if c == '"':
+                in_string = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[start: i + 1]
+        i += 1
+    raise ValueError(f"Unterminated: {token}")
+
+
+# ---------------------------------------------------------------------------
+#  KiCad writer
+# ---------------------------------------------------------------------------
+class _KiCadWriter:
+    def __init__(self, sch: "Schematic"):
+        self.sch = sch
+        self._sym_cache: Dict[str, str] = {}
+
+    def write(self, path: Path):
+        proj = path.stem
+        root = _uid(proj, "root")
+        L = self._header(proj, root)
+        L += self._lib_symbols()
+        L += self._wires_and_labels(proj)
+        L += self._symbols(proj, root)
+        L += self._footer()
+        path.write_text("\n".join(L) + "\n", encoding="utf-8")
+
+    def _header(self, proj: str, root: str) -> List[str]:
+        return [
+            "(kicad_sch",
+            f"\t(version {KICAD_SCHEMATIC_VERSION})",
+            '\t(generator "Taurus")',
+            '\t(generator_version "1.0")',
+            f'\t(uuid "{root}")',
+            '\t(paper "A1")',
+            "\t(lib_symbols",
+        ]
+
+    def _lib_symbols(self) -> List[str]:
+        lines: List[str] = []
+        seen: Set[str] = set()
+        shared = self.sch.kicad_shared
+        for inst in self.sch.instances:
+            spec = inst.component.device_set.symbol_spec
+            if spec.library_id in seen:
+                continue
+            seen.add(spec.library_id)
+            block = self._sym_cache.get(spec.library_id)
+            if block is None:
+                p = shared / "symbols" / spec.library_file
+                txt = p.read_text(encoding="utf-8")
+                block = _extract_sym_block(txt, f'(symbol "{spec.symbol_name}"')
+                # Rename top-level and all sub-symbols: "R" → "Device:R", "R_0_1" → "Device:R_0_1"
+                block = block.replace(
+                    f'(symbol "{spec.symbol_name}_',
+                    f'(symbol "{spec.library_id}_',
+                )
+                block = block.replace(
+                    f'(symbol "{spec.symbol_name}"',
+                    f'(symbol "{spec.library_id}"',
+                )
+                self._sym_cache[spec.library_id] = block
+            for ln in block.splitlines():
+                lines.append(f"\t\t{ln.lstrip()}" if ln.strip() else "")
+        lines.append("\t)")
+        return lines
+
+    def _wires_and_labels(self, proj: str) -> List[str]:
+        router = _Router(self.sch)
+        router.run()
+        lines: List[str] = []
+        for idx, (x1, y1, x2, y2) in enumerate(router.wires):
+            wu = _uid(proj, "wire", idx)
+            lines += [
+                "\t(wire",
+                "\t\t(pts",
+                f"\t\t\t(xy {_fc(x1)} {_fc(y1)}) (xy {_fc(x2)} {_fc(y2)})",
+                "\t\t)",
+                "\t\t(stroke (width 0) (type solid))",
+                f'\t\t(uuid "{wu}")',
+                "\t)",
+            ]
+        for idx, (name, lx, ly, rot, jst) in enumerate(router.labels):
+            lu = _uid(proj, "label", idx)
+            lines += [
+                f'\t(label "{name}"',
+                f"\t\t(at {_fc(lx)} {_fc(ly)} {rot})",
+                "\t\t(effects (font (size 1.27 1.27))",
+                f"\t\t\t(justify {jst}))",
+                f'\t\t(uuid "{lu}")',
+                "\t)",
+            ]
+        return lines
+
+    def _symbols(self, proj: str, root: str) -> List[str]:
+        lines: List[str] = []
+        for inst in self.sch.instances:
+            lines += self._one_sym(inst.component, proj, root)
+        return lines
+
+    def _one_sym(self, c: PlacedPart, proj: str, root: str) -> List[str]:
+        spec = c.device_set.symbol_spec
+        su = _uid(proj, c.reference, "sym")
+        rdx, rdy = _rot(spec.reference_offset[:2], c.rotation)
+        vdx, vdy = _rot(spec.value_offset[:2], c.rotation)
+        rr = (spec.reference_offset[2] + c.rotation) % 360
+        vr = (spec.value_offset[2] + c.rotation) % 360
+        L = [
+            "\t(symbol",
+            f'\t\t(lib_id "{spec.library_id}")',
+            f"\t\t(at {_fc(c.x)} {_fc(c.y)} {c.rotation})",
+            "\t\t(unit 1)",
+            "\t\t(exclude_from_sim no)",
+            "\t\t(in_bom yes)",
+            "\t\t(on_board yes)",
+            "\t\t(dnp no)",
+            f'\t\t(uuid "{su}")',
+        ]
+        L += self._prop("Reference", c.reference, c.x + rdx, c.y + rdy, rr)
+        L += self._prop("Value", c.device.name, c.x + vdx, c.y + vdy, vr)
+        L += self._prop("Footprint", c.device.package or "", c.x, c.y, c.rotation, True)
+        L += self._prop("Datasheet", "~", c.x, c.y, c.rotation, True)
+        L += self._prop("Description", spec.description, c.x, c.y, c.rotation, True)
+        for pn in spec.pin_order:
+            pu = _uid(proj, c.reference, "pin", pn)
+            L += [f'\t\t(pin "{pn}"', f'\t\t\t(uuid "{pu}")', "\t\t)"]
+        L += [
+            "\t\t(instances",
+            f'\t\t\t(project "{proj}"',
+            f'\t\t\t\t(path "/{root}"',
+            f'\t\t\t\t\t(reference "{c.reference}")',
+            "\t\t\t\t\t(unit 1)", "\t\t\t\t)", "\t\t\t)", "\t\t)",
+            "\t)",
+        ]
+        return L
+
+    @staticmethod
+    def _prop(name, val, x, y, rot, hidden=False) -> List[str]:
+        L = [
+            f'\t\t(property "{name}" "{val}"',
+            f"\t\t\t(at {_fc(x)} {_fc(y)} {rot})",
+            "\t\t\t(effects (font (size 1.27 1.27))",
+        ]
+        if hidden:
+            L[-1] += " (hide yes)"
+        L += ["\t\t\t)", "\t\t)"]
+        return L
+
+    def _footer(self) -> List[str]:
+        return [
+            "\t(sheet_instances",
+            '\t\t(path "/"', '\t\t\t(page "1")', "\t\t)", "\t)",
+            "\t(embedded_fonts no)",
+            ")",
+        ]
+
+
+# ---------------------------------------------------------------------------
+#  KiCad reader – roundtrip
+# ---------------------------------------------------------------------------
+class _KiCadReader:
+    def __init__(self, path: Path, kicad_shared: Path):
+        self.path = path
+        self.kicad_shared = kicad_shared
+
+    def read(self) -> "Schematic":
+        tree = S.parse(self.path.read_text(encoding="utf-8"))
+        root = tree[0]
+        sch = Schematic(kicad_shared_path=self.kicad_shared)
+        for sym_node in S.find_all(root, "symbol"):
+            lib_id = S.get_value(sym_node, "lib_id")
+            if lib_id is None:
+                continue
+            ref = S.get_property(sym_node, "Reference") or "?"
+            value = S.get_property(sym_node, "Value") or ""
+            prefix = ""
+            for ch in ref:
+                if ch.isalpha():
+                    prefix += ch
+                else:
+                    break
+            if prefix not in SYMBOL_SPECS:
+                continue
+            alias = REQUIRED_LIBRARY_ALIAS.get(prefix)
+            if alias and alias not in sch.libraries:
+                sch.init_libraries(alias)
+            ds_name = f"{prefix}_imported"
+            if ds_name not in sch.device_sets:
+                ds = sch.init_device_set(ds_name, prefix)
+                sch.init_device(ds, value or prefix)
+            dev_name = value or prefix
+            if dev_name not in sch.device_sets[ds_name].devices:
+                sch.init_device(sch.device_sets[ds_name], dev_name)
+            inst = sch.add_instance(ds_name, dev_name, prefix)
+            at_node = S.find(sym_node, "at")
+            if at_node and len(at_node) >= 3:
+                inst.component.x = float(at_node[1])
+                inst.component.y = float(at_node[2])
+                if len(at_node) >= 4:
+                    inst.component.rotation = int(float(at_node[3]))
+            inst.component.reference = ref
+            sch.parts[ref] = inst.component
+        return sch
+
+
+# ---------------------------------------------------------------------------
+#  Eagle writer – fallback backend via eaglepy
+# ---------------------------------------------------------------------------
+class _EagleWriter:
+    def __init__(self, sch: "Schematic"):
+        self.sch = sch
+
+    def write(self, path: Path):
+        from .eaglepy.eagle import (
+            Eagle, Drawing, Grid, Schematic as ES, Sheet, Net,
+            Part as EP, Library, Device_Set, Device as ED,
+            Symbol as ESym, Segment, Instance as EI, Gate,
+            attributes,
+        )
+        from .eaglepy import default_layers
+        from .eaglepy.primitives import Wire, Pin, Pin_Ref as PinRef
+
+        grid = Grid(distance=0.1, unit_dist="inch", unit="inch",
+                     style="lines", multiple=1, display=False)
+        layers = default_layers.get_layers()
+        sheet = Sheet()
+        es = ES(sheets=[sheet])
+        drawing = Drawing(grid=grid, layers=layers, document=es)
+
+        elibs: Dict[str, Library] = {}
+        eds: Dict[str, Device_Set] = {}
+
+        for inst in self.sch.instances:
+            spec = inst.component.device_set.symbol_spec
+            pf = inst.prefix
+            if pf in elibs:
+                continue
+            ln = {"Q": "transistor-npn", "R": "resistor-power"}.get(pf, pf)
+            lib = Library(name=ln)
+            pins = []
+            for pn in spec.pin_order:
+                px, py = spec.pin_positions[pn]
+                pins.append(Pin(name=pn, x=px, y=-py, visible="off",
+                                length="short", direction="pas",
+                                rotation=attributes.Rotation(0)))
+            esym = ESym(name=pf, items=pins)
+            lib.symbols.append(esym)
+            ds = Device_Set(name=f"{pf}_", prefix=pf,
+                            gates=[Gate(name="G$1", symbol=esym, x=0, y=0)])
+            lib.device_sets.append(ds)
+            elibs[pf] = lib
+            eds[pf] = ds
+            es.libraries.append(lib)
+
+        for inst in self.sch.instances:
+            ds = eds[inst.prefix]
+            dn = inst.component.device.name
+            if not any(d.name == dn for d in ds.devices):
+                ds.devices.append(ED(name=dn, package=None))
+
+        for inst in self.sch.instances:
+            ds = eds[inst.prefix]
+            lib = elibs[inst.prefix]
+            dev = next(d for d in ds.devices
+                       if d.name == inst.component.device.name)
+            part = EP(name=inst.component.reference, library=lib,
+                      device_set=ds, device=dev)
+            es.parts.append(part)
+            ei = EI(part=part, x=inst.component.x, y=-inst.component.y,
+                     gate=ds.gates[0],
+                     rotation=attributes.Rotation(inst.component.rotation))
+            sheet.instances.append(ei)
+
+        router = _Router(self.sch)
+        router.run()
+        for net_name, members in router.nets:
+            pin_refs = set()
+            wires = []
+            for ref, pin in members:
+                pin_refs.add(PinRef(part=ref, gate="G$1", pin=pin))
+            for ref, pin in members:
+                comp = self.sch.parts[ref]
+                spec = comp.device_set.symbol_spec
+                px, py = spec.pin_positions[pin]
+                rx, ry = _rot((px, py), comp.rotation)
+                ax, ay = comp.x + rx, comp.y + ry
+                o = (spec.pin_orientations[pin] + comp.rotation) % 360
+                dx, dy = _outward(o)
+                bx, by = ax + dx * 2.54, ay + dy * 2.54
+                wires.append(Wire(x1=ax, y1=-ay, x2=bx, y2=-by, width=0.2))
+            seg = Segment(items=list(pin_refs) + wires)
+            net = Net(name=net_name, net_class=0)
+            net.segments.append(seg)
+            es.sheets[0].nets.append(net)
+
+        Eagle(drawing=drawing).save(path)
+
+
+# ---------------------------------------------------------------------------
+#  Schematic (main public class)
+# ---------------------------------------------------------------------------
+class Schematic:
+    def __init__(self, kicad_shared_path: Optional[Path] = None):
+        self.kicad_shared = Path(
+            kicad_shared_path
+            or os.environ.get("TAURUS_KICAD_SHARED_PATH", DEFAULT_KICAD_SHARED)
+        )
+        self.libraries: Dict[str, dict] = {}
+        self.device_sets: Dict[str, DeviceSet] = {}
+        self.devices: Dict[tuple, Device] = {}
+        self.parts: Dict[str, PlacedPart] = {}
+        self.instances: List[Instance] = []
+        self.part_counters: Dict[str, int] = defaultdict(int)
+
+    def init_libraries(self, *names: str):
+        for name in names:
+            if name not in SUPPORTED_LIBRARY_ALIASES:
+                raise ValueError(f"Unsupported library alias: {name}")
+            self.libraries[name] = SUPPORTED_LIBRARY_ALIASES[name]
+
+    def init_device_set(self, name: str, prefix: str) -> DeviceSet:
+        alias = REQUIRED_LIBRARY_ALIAS.get(prefix)
+        if alias and alias not in self.libraries:
+            raise ValueError(f"Library {alias} not initialized")
+        ds = DeviceSet(name=name, prefix=prefix, symbol_spec=SYMBOL_SPECS[prefix])
         self.device_sets[name] = ds
         return ds
 
-    def init_device(self, ds, name, package=None):
+    def init_device(self, ds: DeviceSet, name: str, package: str | None = None) -> Device:
         dev = Device(name=name, package=package)
-        ds.devices.append(dev)
-        self.devices[name] = dev
+        ds.devices[name] = dev
+        self.devices[(ds.name, name)] = dev
+        return dev
 
-    def add_instance(self, device_set_name, part_name, prefix):
-        if prefix not in self.part_counters:
-            self.part_counters[prefix] = 0
-        self.part_counters[prefix] += 1
-        full_part_name = f"{prefix}{self.part_counters[prefix]}"
+    def add_instance(self, device_set_name: str, part_name: str, prefix: str) -> Instance:
         ds = self.device_sets[device_set_name]
-        lib = next(lib for lib in self.libraries.values() if ds in lib.device_sets)
-        part = EaglePart(name=full_part_name, library=lib, device_set=ds, device=ds.devices[part_name])
-        self.parts[full_part_name] = part
-        self.eagle_schematic.parts.append(part)
-        eagle_instance = EagleInstance(
-            part=part, x=0, y=0, gate=ds.gates[0], rotation=attributes.Rotation(0)
-        )
-        instance = Instance(eagle_instance, self, device_set_name, part_name, prefix)
-        self.instances.append(instance)
-        self.sheet.instances.append(eagle_instance)
-        self._organize_components()
-        return instance
-
-    def _organize_components(self):
-        bounds = organize_components([i.eagle_instance for i in self.instances])
-        self.sheet.width = bounds['width']
-        self.sheet.height = bounds['height']
-        self.sheet.x = bounds['x']
-        self.sheet.y = bounds['y']
+        if prefix != ds.prefix:
+            raise ValueError(f"Prefix mismatch: {prefix} vs {ds.prefix}")
+        if part_name not in ds.devices:
+            raise ValueError(f"Device {part_name} not in {device_set_name}")
+        self.part_counters[prefix] += 1
+        ref = f"{prefix}{self.part_counters[prefix]}"
+        comp = PlacedPart(reference=ref, device_set=ds,
+                          device=ds.devices[part_name], prefix=prefix)
+        self.parts[ref] = comp
+        inst = Instance(comp, self, part_name, device_set_name, prefix)
+        self.instances.append(inst)
+        _layout(self.instances)
+        return inst
 
     def wire_up(self):
-        # Compute pin positions
-        pin_positions = {}
-        for instance in self.instances:
-            inst = instance.eagle_instance
-            for pin in get_pins_from_symbol(inst.gate.symbol):
-                abs_pos = compute_absolute_position(inst.x, inst.y, inst.rotation, pin['x'], pin['y'])
-                pin_positions[(inst.part.name, pin['name'])] = abs_pos
+        _layout(self.instances)
 
-        # Collect all direct connections and group into nets
-        uf = UnionFind()
-        connections = []
-        for instance in self.instances:
-            for pin, (target_instance, target_pin) in instance.connections.items():
-                start = (instance.eagle_instance.part.name, pin)
-                end = (target_instance.eagle_instance.part.name, target_pin)
-                start_pos = pin_positions[start]
-                end_pos = pin_positions[end]
-                uf.union(start, end)
-                connections.append({
-                    'start_part': start[0], 'start_pin': start[1],
-                    'end_part': end[0], 'end_pin': end[1],
-                    'start_pos': start_pos, 'end_pos': end_pos
-                })
+    def save(self, filename: str, backend: str = "kicad"):
+        path = Path(filename)
+        if backend == "kicad":
+            if path.suffix != ".kicad_sch":
+                path = path.with_suffix(".kicad_sch")
+            _KiCadWriter(self).write(path)
+        elif backend == "eagle":
+            if path.suffix != ".sch":
+                path = path.with_suffix(".sch")
+            _EagleWriter(self).write(path)
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
+        print(f"Schematic saved to {path} ({backend})")
 
-        nets = defaultdict(list)
-        for conn in connections:
-            root = uf.find((conn['start_part'], conn['start_pin']))
-            nets[root].append(conn)
+    @classmethod
+    def load(cls, filename: str, kicad_shared_path: Optional[Path] = None) -> "Schematic":
+        path = Path(filename)
+        shared = Path(kicad_shared_path or DEFAULT_KICAD_SHARED)
+        if path.suffix == ".kicad_sch":
+            return _KiCadReader(path, shared).read()
+        raise ValueError(f"Unsupported format: {path.suffix}")
 
-        # Assign tracks to horizontal connections
-        horizontal_conns = [
-            conn for conn in connections
-            if conn['start_pos'][0] != conn['end_pos'][0]
-        ]
-        horizontal_conns.sort(key=lambda c: min(c['start_pos'][0], c['end_pos'][0]))
-        tracks = []
-        for conn in horizontal_conns:
-            x_range = (min(conn['start_pos'][0], conn['end_pos'][0]), 
-                      max(conn['start_pos'][0], conn['end_pos'][0]))
-            assigned = False
-            for i, track in enumerate(tracks):
-                if not any(x_range[0] < t[1] and x_range[1] > t[0] for t in track):
-                    track.append(x_range)
-                    conn['track'] = i
-                    assigned = True
-                    break
-            if not assigned:
-                tracks.append([x_range])
-                conn['track'] = len(tracks) - 1
 
-        # Define track positions
-        track_spacing = 2
-        max_y = max(inst.eagle_instance.y for inst in self.instances) if self.instances else 0
-        y_base = max_y + 5
-
-        # Route wires for each net
-        existing_net_names = set()
-        for net_root, net_conns in nets.items():
-            # Generate unique net name
-            parts = {p for p, _ in list(uf.parent.items()) if uf.find((p, None)) == net_root}
-            
-            counts = defaultdict(int)
-            for p in parts:
-                counts[p[0]] += 1
-            name_parts = [f"{t}{counts[t]}" for t in sorted(counts.keys())]
-            base_name = "net_" + "_".join(name_parts)
-            net_name = base_name
-            suffix = 1
-            while net_name in existing_net_names:
-                net_name = f"{base_name}_{suffix}"
-                suffix += 1
-            existing_net_names.add(net_name)
-
-            # Route wires
-            wires = []
-            pin_refs = set()
-            for conn in net_conns:
-                sx, sy = conn['start_pos']
-                ex, ey = conn['end_pos']
-                pin_refs.add(PinRef(part=conn['start_part'], gate="G$1", pin=conn['start_pin']))
-                pin_refs.add(PinRef(part=conn['end_part'], gate="G$1", pin=conn['end_pin']))
-                if sx == ex:
-                    wires.append(Wire(x1=sx, y1=sy, x2=ex, y2=ey, width=0.2))
-                else:
-                    track = conn.get('track')
-                    if track is not None:
-                        y_track = y_base + track * track_spacing
-                        wires.extend([
-                            Wire(x1=sx, y1=sy, x2=sx, y2=y_track, width=0.2),
-                            Wire(x1=sx, y1=y_track, x2=ex, y2=y_track, width=0.2),
-                            Wire(x1=ex, y1=y_track, x2=ex, y2=ey, width=0.2)
-                        ])
-
-            segment = Segment(items=list(pin_refs) + wires)
-            net = Net(name=net_name, net_class=0)
-            net.segments.append(segment)
-            self.eagle_schematic.sheets[0].nets.append(net)
-
-    def save(self, filename):
-        eagle = Eagle(drawing=self.drawing)
-        eagle.save(Path(filename))
-        print(f"Schematic saved to {filename}")
-
+# ---------------------------------------------------------------------------
+#  Symbol / Descriptor helpers
+# ---------------------------------------------------------------------------
 class Descriptor:
     def __init__(self, identifier, device_set, part, prefix):
         self.identifier = identifier
@@ -354,68 +702,61 @@ class Descriptor:
         self.part = part
         self.prefix = prefix
 
+
 class Symbol:
     def __init__(self, name, parts=None, descriptors=None, connections=None):
         self.name = name
         self.parts = parts or []
         self.descriptors = descriptors or []
-        self.descriptor_counters = {}
+        self.descriptor_counters: Dict[str, int] = {}
         self.connections = connections or {}
 
     def add_descriptor(self, device_set, part, prefix):
         self.descriptor_counters[prefix] = self.descriptor_counters.get(prefix, 0) + 1
-        descriptor = Descriptor(self.descriptor_counters[prefix], device_set, part, prefix)
-        self.descriptors.append(descriptor)
-        return descriptor
+        d = Descriptor(self.descriptor_counters[prefix], device_set, part, prefix)
+        self.descriptors.append(d)
+        return d
 
     def add_connection(self, pin_name, source_instance, target):
         self.connections[pin_name] = (source_instance, target)
 
     def to_xml(self):
-        symbol_elem = ET.Element("symbol", {"name": self.name})
-        instances_elem = ET.SubElement(symbol_elem, "instances")
+        root = ET.Element("symbol", {"name": self.name})
+        inst_el = ET.SubElement(root, "instances")
         for d in self.descriptors:
-            ET.SubElement(instances_elem, "instance", {
-                "identifier": str(d.identifier),
-                "device_set": d.device_set,
-                "part": d.part,
-                "prefix": d.prefix
+            ET.SubElement(inst_el, "instance", {
+                "identifier": str(d.identifier), "device_set": d.device_set,
+                "part": d.part, "prefix": d.prefix,
             })
-        connections_elem = ET.SubElement(symbol_elem, "connections")
-        for pin_name, (src, (tgt, tgt_pin)) in self.connections.items():
-            src_str = f"{src.identifier}:{src.device_set}:{src.part}:{src.prefix}:{pin_name}"
-            tgt_str = f"{tgt.identifier}:{tgt.device_set}:{tgt.part}:{tgt.prefix}:{tgt_pin}"
-            ET.SubElement(connections_elem, "connection", {
-                "source_instance": src_str,
-                "target_instance": tgt_str
-            })
-        return ET.tostring(symbol_elem, encoding='unicode')
+        conn_el = ET.SubElement(root, "connections")
+        for pn, (src, (tgt, tp)) in self.connections.items():
+            sv = f"{src.identifier}:{src.device_set}:{src.part}:{src.prefix}:{pn}"
+            tv = f"{tgt.identifier}:{tgt.device_set}:{tgt.part}:{tgt.prefix}:{tp}"
+            ET.SubElement(conn_el, "connection",
+                          {"source_instance": sv, "target_instance": tv})
+        return ET.tostring(root, encoding="unicode")
 
     def save(self, filename):
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(self.to_xml())
+        Path(filename).write_text(self.to_xml(), encoding="utf-8")
         print(f"Symbol saved to {filename}")
 
     @staticmethod
     def load(filename, schematic):
-        with open(filename, 'r', encoding='utf-8') as f:
-            return Symbol.from_xml(f.read(), schematic)
+        return Symbol.from_xml(Path(filename).read_text("utf-8"), schematic)
 
     @staticmethod
     def from_xml(xml_string, schematic):
         root = ET.fromstring(xml_string)
-        symbol = Symbol(root.attrib["name"])
+        sym = Symbol(root.attrib["name"])
         for inst in root.find("instances").findall("instance"):
-            symbol.descriptors.append(Descriptor(
-                int(inst.attrib["identifier"]),
-                inst.attrib["device_set"],
-                inst.attrib["part"],
-                inst.attrib["prefix"]
+            sym.descriptors.append(Descriptor(
+                int(inst.attrib["identifier"]), inst.attrib["device_set"],
+                inst.attrib["part"], inst.attrib["prefix"],
             ))
         for conn in root.find("connections").findall("connection"):
-            src_parts = conn.attrib["source_instance"].split(":")
-            tgt_parts = conn.attrib["target_instance"].split(":")
-            src = next(d for d in symbol.descriptors if d.identifier == int(src_parts[0]))
-            tgt = next(d for d in symbol.descriptors if d.identifier == int(tgt_parts[0]))
-            symbol.add_connection(src_parts[4], src, (tgt, tgt_parts[4]))
-        return symbol
+            sp = conn.attrib["source_instance"].split(":")
+            tp = conn.attrib["target_instance"].split(":")
+            sd = next(d for d in sym.descriptors if d.identifier == int(sp[0]))
+            td = next(d for d in sym.descriptors if d.identifier == int(tp[0]))
+            sym.add_connection(sp[4], sd, (td, tp[4]))
+        return sym

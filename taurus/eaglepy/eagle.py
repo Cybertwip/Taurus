@@ -16,8 +16,10 @@ import io as StringIO
 # Otherwise, use ``xml``.
 try:
     from lxml import etree as ElementTree
+    _USE_LXML = True
 except:
     from xml.etree import ElementTree
+    _USE_LXML = False
 
 class Eagle:
     TAG_NAME = constants.TAGS.EAGLE
@@ -122,7 +124,11 @@ class Eagle:
                 nn.append_node(n_compatibility)
         
         # Save    
-        xml_str = ElementTree.tostring(tree, xml_declaration=True, encoding=self.encoding, pretty_print=True)
+        if _USE_LXML:
+            xml_str = ElementTree.tostring(tree, xml_declaration=True, encoding=self.encoding, pretty_print=True)
+        else:
+            ElementTree.indent(tree)
+            xml_str = ElementTree.tostring(tree.getroot(), xml_declaration=True, encoding=self.encoding)
         
         # Ensure the file is written as a string
         with open(file_name, 'w', encoding=self.encoding) as f:
