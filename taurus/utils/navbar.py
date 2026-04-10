@@ -1,5 +1,5 @@
 import pygame
-from utils.colors import COLORS
+from .colors import COLORS
 
 class Menu:
     def __init__(self,screen,items=[]) -> None:

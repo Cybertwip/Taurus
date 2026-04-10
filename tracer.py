@@ -1,264 +1,459 @@
 #!/usr/bin/env python3
-"""
-Taurus Tracer – generates transistor-level schematics.
-
-Circuits:
-    4-bit ripple-carry adder  (transistor-level, fixed wiring)
-    RISC-V ALU slice          (4-bit, ADD/SUB/AND/OR/XOR)
-
-Outputs:
-    .kicad_sch (primary) and .sch (Eagle fallback)
-
-Roundtrip test:
-    Write → Read → Re-write, then verify file matches.
-"""
+"""Generate low-level chip schematics with explicit wiring and bit-slice layout."""
 from __future__ import annotations
+
+import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
 from taurus import schematic
 
+GRID_MM = 1.27
 
-# ── Schematic helpers ─────────────────────────────────────────────────────
+LOW_LEVEL_GATE_SPECS = {
+    "NAND": {"library_id": "74xGxx:74LVC1G00", "inputs": ("1", "2"), "output": "4", "vcc": "5", "gnd": "3"},
+    "NOR": {"library_id": "74xGxx:74LVC1G02", "inputs": ("1", "2"), "output": "4", "vcc": "5", "gnd": "3"},
+    "NOT": {"library_id": "74xGxx:74LVC1G04", "inputs": ("2",), "output": "4", "vcc": "5", "gnd": "3"},
+    "AND": {"library_id": "74xGxx:74LVC1G08", "inputs": ("1", "2"), "output": "4", "vcc": "5", "gnd": "3"},
+    "OR": {"library_id": "74xGxx:74LVC1G32", "inputs": ("1", "2"), "output": "4", "vcc": "5", "gnd": "3"},
+    "XOR": {"library_id": "74xGxx:74LVC1G86", "inputs": ("1", "2"), "output": "4", "vcc": "5", "gnd": "3"},
+}
+
+
+@dataclass
+class GateChip:
+    instance: schematic.Instance
+    gate_type: str
+    input_pins: tuple[str, ...]
+    output_pin: str
+    vcc_pin: str
+    gnd_pin: str
+
+    def label_input(self, index: int, net_name: str):
+        self.instance.schematic.label_pin(self.instance, self.input_pins[index], net_name)
+
+    def label_output(self, net_name: str):
+        self.instance.schematic.label_pin(self.instance, self.output_pin, net_name)
+
+    def wire_to(self, target: "GateChip", target_input_index: int):
+        self.instance.wire(self.output_pin, target.instance, target.input_pins[target_input_index])
+
+
+@dataclass
+class ExportGate:
+    chips: list[GateChip]
+    inputs: list[tuple[GateChip, int]]
+    output: GateChip
+
+
+@dataclass
+class AdderSlice:
+    xor_ab: GateChip
+    and_ab: GateChip
+    xor_sum: GateChip
+    and_carry: GateChip
+    or_carry: GateChip
+
+
+@dataclass
+class AluSlice:
+    xor_ab: GateChip
+    and_ab: GateChip
+    or_ab: GateChip
+    xor_sum: GateChip
+    and_carry: GateChip
+    or_carry: GateChip
+    inv_op0: GateChip
+    inv_op1: GateChip
+    dec_and: GateChip
+    dec_or: GateChip
+    dec_xor: GateChip
+    dec_sum: GateChip
+    gate_and: GateChip
+    gate_or: GateChip
+    gate_xor: GateChip
+    gate_sum: GateChip
+    mix_ab: GateChip
+    mix_cd: GateChip
+    out: GateChip
+
+
+def _snap(value: float) -> float:
+    return round(value / GRID_MM) * GRID_MM
+
+
+def _choose_paper(width_mm: float, height_mm: float) -> str:
+    if width_mm <= 210 and height_mm <= 297:
+        return "A4"
+    if width_mm <= 297 and height_mm <= 420:
+        return "A3"
+    if width_mm <= 420 and height_mm <= 594:
+        return "A2"
+    return "A1"
+
+
+def _new_page_schematic(paper: str = "A3") -> schematic.Schematic:
+    return schematic.Schematic(paper=paper)
+
 
 def _new_sch() -> schematic.Schematic:
-    sch = schematic.Schematic()
-    sch.init_libraries("transistor-npn", "resistor-power")
-    t = sch.init_device_set("BJT_", "Q")
-    sch.init_device(t, "NPN")
-    r = sch.init_device_set("R_", "R")
-    sch.init_device(r, "RES")
+    return _new_page_schematic()
+
+
+def _device_set_name(library_id: str) -> str:
+    return library_id.replace(":", "_") + "_"
+
+
+def _add_real_device(sch: schematic.Schematic, library_id: str,
+                     value: str, prefix: str = "U") -> schematic.Instance:
+    ds_name = _device_set_name(library_id)
+    if ds_name not in sch.device_sets:
+        ds = sch.init_device_set(ds_name, prefix, library_id=library_id)
+        sch.init_device(ds, value)
+    return sch.add_instance(ds_name, value, prefix)
+
+
+def _build_gate_chip(sch: schematic.Schematic, gate_type: str,
+                     x: float, y: float) -> GateChip:
+    spec = LOW_LEVEL_GATE_SPECS[gate_type]
+    value = spec["library_id"].split(":", 1)[1]
+    inst = _add_real_device(sch, spec["library_id"], value)
+    sch.place(inst, _snap(x), _snap(y))
+    chip = GateChip(
+        instance=inst,
+        gate_type=gate_type,
+        input_pins=tuple(spec["inputs"]),
+        output_pin=spec["output"],
+        vcc_pin=spec["vcc"],
+        gnd_pin=spec["gnd"],
+    )
+    sch.label_pin(chip.instance, chip.vcc_pin, "+5V")
+    sch.label_pin(chip.instance, chip.gnd_pin, "GND")
+    return chip
+
+
+def _fanout(source: GateChip, *targets: tuple[GateChip, int]):
+    for target, input_index in targets:
+        source.wire_to(target, input_index)
+
+
+def _stage_box(sch: schematic.Schematic, left: float, top: float,
+               right: float, bottom: float, title: str,
+               stroke_type: str = "dash"):
+    sch.add_box(left, top, right, bottom, stroke_width=0.2, stroke_type=stroke_type)
+    sch.add_text(title, left + 1.27, top - 1.27, size=1.5)
+
+
+def build_nand(sch: schematic.Schematic, x: float = 30.48, y: float = 30.48,
+               input_nets: tuple[Optional[str], Optional[str]] = (None, None),
+               output_net: Optional[str] = None) -> GateChip:
+    chip = _build_gate_chip(sch, "NAND", x, y)
+    for idx, net in enumerate(input_nets):
+        if net:
+            chip.label_input(idx, net)
+    if output_net:
+        chip.label_output(output_net)
+    return chip
+
+
+def build_nor(sch: schematic.Schematic, x: float = 30.48, y: float = 30.48,
+              input_nets: tuple[Optional[str], Optional[str]] = (None, None),
+              output_net: Optional[str] = None) -> GateChip:
+    chip = _build_gate_chip(sch, "NOR", x, y)
+    for idx, net in enumerate(input_nets):
+        if net:
+            chip.label_input(idx, net)
+    if output_net:
+        chip.label_output(output_net)
+    return chip
+
+
+def build_not(sch: schematic.Schematic, x: float = 30.48, y: float = 30.48,
+              input_net: Optional[str] = None,
+              output_net: Optional[str] = None) -> GateChip:
+    chip = _build_gate_chip(sch, "NOT", x, y)
+    if input_net:
+        chip.label_input(0, input_net)
+    if output_net:
+        chip.label_output(output_net)
+    return chip
+
+
+def build_and(sch: schematic.Schematic, x: float = 30.48, y: float = 30.48,
+              input_nets: tuple[Optional[str], Optional[str]] = (None, None),
+              output_net: Optional[str] = None) -> GateChip:
+    chip = _build_gate_chip(sch, "AND", x, y)
+    for idx, net in enumerate(input_nets):
+        if net:
+            chip.label_input(idx, net)
+    if output_net:
+        chip.label_output(output_net)
+    return chip
+
+
+def build_or(sch: schematic.Schematic, x: float = 30.48, y: float = 30.48,
+             input_nets: tuple[Optional[str], Optional[str]] = (None, None),
+             output_net: Optional[str] = None) -> GateChip:
+    chip = _build_gate_chip(sch, "OR", x, y)
+    for idx, net in enumerate(input_nets):
+        if net:
+            chip.label_input(idx, net)
+    if output_net:
+        chip.label_output(output_net)
+    return chip
+
+
+def build_xor(sch: schematic.Schematic, x: float = 30.48, y: float = 30.48,
+              input_nets: tuple[Optional[str], Optional[str]] = (None, None),
+              output_net: Optional[str] = None) -> GateChip:
+    chip = _build_gate_chip(sch, "XOR", x, y)
+    for idx, net in enumerate(input_nets):
+        if net:
+            chip.label_input(idx, net)
+    if output_net:
+        chip.label_output(output_net)
+    return chip
+
+
+def build_xnor(sch: schematic.Schematic, x: float = 30.48, y: float = 30.48,
+               input_nets: tuple[Optional[str], Optional[str]] = (None, None),
+               output_net: Optional[str] = None,
+               net_prefix: str = "XNOR") -> tuple[GateChip, GateChip]:
+    xor_net = f"{net_prefix}_XOR"
+    xor_chip = build_xor(sch, x, y, input_nets, None)
+    not_chip = build_not(sch, x, y + 20.32, None, output_net)
+    xor_chip.label_output(xor_net)
+    xor_chip.wire_to(not_chip, 0)
+    return xor_chip, not_chip
+
+
+def _make_export_gate(sch: schematic.Schematic, gate_type: str, x: float, y: float,
+                      tag: str) -> ExportGate:
+    if gate_type == "NOT":
+        chip = _build_gate_chip(sch, "NOT", x, y)
+        return ExportGate([chip], [(chip, 0)], chip)
+    if gate_type == "XNOR":
+        xor_chip = _build_gate_chip(sch, "XOR", x, y)
+        not_chip = _build_gate_chip(sch, "NOT", x, y + 17.78)
+        xor_chip.wire_to(not_chip, 0)
+        return ExportGate([xor_chip, not_chip], [(xor_chip, 0), (xor_chip, 1)], not_chip)
+    chip = _build_gate_chip(sch, gate_type, x, y)
+    return ExportGate([chip], [(chip, idx) for idx in range(len(chip.input_pins))], chip)
+
+
+def _build_adder_slice(sch: schematic.Schematic, bit: int,
+                       left: float, top: float) -> AdderSlice:
+    sch.add_box(left, top, left + 68.58, top + 109.22, stroke_width=0.2, stroke_type="solid")
+    sch.add_text(f"BIT {bit}", left + 1.27, top - 2.54, size=1.8)
+    _stage_box(sch, left + 2.54, top + 10.16, left + 30.48, top + 63.50, "Logic")
+    _stage_box(sch, left + 35.56, top + 10.16, left + 66.04, top + 95.25, "Carry")
+
+    xor_ab = _build_gate_chip(sch, "XOR", left + 16.51, top + 27.94)
+    and_ab = _build_gate_chip(sch, "AND", left + 16.51, top + 50.80)
+    xor_sum = _build_gate_chip(sch, "XOR", left + 49.53, top + 27.94)
+    and_carry = _build_gate_chip(sch, "AND", left + 49.53, top + 50.80)
+    or_carry = _build_gate_chip(sch, "OR", left + 49.53, top + 73.66)
+
+    xor_ab.label_input(0, f"A{bit}")
+    xor_ab.label_input(1, f"B{bit}")
+    and_ab.label_input(0, f"A{bit}")
+    and_ab.label_input(1, f"B{bit}")
+
+    _fanout(xor_ab, (xor_sum, 0), (and_carry, 1))
+    and_ab.wire_to(or_carry, 0)
+    and_carry.wire_to(or_carry, 1)
+    xor_sum.label_output(f"S{bit}")
+
+    return AdderSlice(xor_ab, and_ab, xor_sum, and_carry, or_carry)
+
+
+def build_4bit_adder() -> schematic.Schematic:
+    sch = _new_page_schematic("A2")
+    slices = []
+    left = 17.78
+    top = 25.40
+    step = 88.90
+    for bit in range(4):
+        slices.append(_build_adder_slice(sch, bit, left + bit * step, top))
+
+    slices[0].xor_sum.label_input(1, "CIN")
+    slices[0].and_carry.label_input(0, "CIN")
+
+    for idx in range(3):
+        carry_source = slices[idx].or_carry
+        _fanout(carry_source, (slices[idx + 1].xor_sum, 1), (slices[idx + 1].and_carry, 0))
+    slices[-1].or_carry.label_output("COUT")
     return sch
 
 
-def _Q(sch: schematic.Schematic) -> schematic.Instance:
-    return sch.add_instance("BJT_", "NPN", "Q")
+def _build_alu_slice(sch: schematic.Schematic, bit: int,
+                     left: float, top: float) -> AluSlice:
+    sch.add_box(left, top, left + 86.36, top + 300.99, stroke_width=0.2, stroke_type="solid")
+    sch.add_text(f"BIT {bit}", left + 1.27, top - 2.54, size=1.8)
+    _stage_box(sch, left + 2.54, top + 10.16, left + 25.40, top + 91.44, "Logic")
+    _stage_box(sch, left + 30.48, top + 10.16, left + 53.34, top + 121.92, "Carry")
+    _stage_box(sch, left + 58.42, top + 10.16, left + 83.82, top + 287.02, "Select")
+
+    xor_ab = _build_gate_chip(sch, "XOR", left + 13.97, top + 27.94)
+    and_ab = _build_gate_chip(sch, "AND", left + 13.97, top + 50.80)
+    or_ab = _build_gate_chip(sch, "OR", left + 13.97, top + 73.66)
+
+    xor_sum = _build_gate_chip(sch, "XOR", left + 41.91, top + 27.94)
+    and_carry = _build_gate_chip(sch, "AND", left + 41.91, top + 50.80)
+    or_carry = _build_gate_chip(sch, "OR", left + 41.91, top + 73.66)
+
+    inv_op0 = _build_gate_chip(sch, "NOT", left + 71.12, top + 27.94)
+    inv_op1 = _build_gate_chip(sch, "NOT", left + 71.12, top + 43.18)
+    dec_and = _build_gate_chip(sch, "AND", left + 71.12, top + 66.04)
+    dec_or = _build_gate_chip(sch, "AND", left + 71.12, top + 81.28)
+    dec_xor = _build_gate_chip(sch, "AND", left + 71.12, top + 101.60)
+    dec_sum = _build_gate_chip(sch, "AND", left + 71.12, top + 116.84)
+    gate_and = _build_gate_chip(sch, "AND", left + 71.12, top + 142.24)
+    gate_or = _build_gate_chip(sch, "AND", left + 71.12, top + 157.48)
+    gate_xor = _build_gate_chip(sch, "AND", left + 71.12, top + 177.80)
+    gate_sum = _build_gate_chip(sch, "AND", left + 71.12, top + 193.04)
+    mix_ab = _build_gate_chip(sch, "OR", left + 71.12, top + 218.44)
+    mix_cd = _build_gate_chip(sch, "OR", left + 71.12, top + 233.68)
+    out = _build_gate_chip(sch, "OR", left + 71.12, top + 259.08)
+
+    for chip in (xor_ab, and_ab, or_ab):
+        chip.label_input(0, f"A{bit}")
+        chip.label_input(1, f"B{bit}")
+
+    inv_op0.label_input(0, "OP0")
+    inv_op1.label_input(0, "OP1")
+    dec_or.label_input(1, "OP0")
+    dec_sum.label_input(1, "OP0")
+    dec_xor.label_input(1, "OP1")
+    dec_sum.label_input(0, "OP1")
+
+    _fanout(xor_ab, (xor_sum, 0), (and_carry, 1), (gate_xor, 0))
+    and_ab.wire_to(or_carry, 0)
+    or_ab.wire_to(gate_or, 0)
+    xor_sum.wire_to(gate_sum, 0)
+    and_carry.wire_to(or_carry, 1)
+
+    _fanout(inv_op0, (dec_and, 1), (dec_xor, 1))
+    _fanout(inv_op1, (dec_and, 0), (dec_or, 0))
+
+    dec_and.wire_to(gate_and, 1)
+    dec_or.wire_to(gate_or, 1)
+    dec_xor.wire_to(gate_xor, 1)
+    dec_sum.wire_to(gate_sum, 1)
+
+    gate_and.wire_to(mix_ab, 0)
+    gate_or.wire_to(mix_ab, 1)
+    gate_xor.wire_to(mix_cd, 0)
+    gate_sum.wire_to(mix_cd, 1)
+    mix_ab.wire_to(out, 0)
+    mix_cd.wire_to(out, 1)
+    out.label_output(f"F{bit}")
+
+    return AluSlice(
+        xor_ab, and_ab, or_ab,
+        xor_sum, and_carry, or_carry,
+        inv_op0, inv_op1,
+        dec_and, dec_or, dec_xor, dec_sum,
+        gate_and, gate_or, gate_xor, gate_sum,
+        mix_ab, mix_cd, out,
+    )
 
 
-def _R(sch: schematic.Schematic) -> schematic.Instance:
-    return sch.add_instance("R_", "RES", "R")
+def build_4bit_alu() -> schematic.Schematic:
+    sch = _new_page_schematic("A2")
+    slices = []
+    left = 12.70
+    top = 20.32
+    step = 96.52
+    for bit in range(4):
+        slices.append(_build_alu_slice(sch, bit, left + bit * step, top))
 
+    slices[0].xor_sum.label_input(1, "CIN")
+    slices[0].and_carry.label_input(0, "CIN")
 
-# ── Transistor-level gate builders ────────────────────────────────────────
-# KiCad Device:Q_NPN pins: B (base), C (collector), E (emitter)
-# KiCad Device:R     pins: 1 (top),  2 (bottom)
-
-def build_nand(sch, label="NAND"):
-    """RTL NAND gate: series NPN pair + pull-up resistor.
-    Returns dict with keys: out, a, b, vcc, gnd."""
-    q1 = _Q(sch)  # Top transistor (input A)
-    q2 = _Q(sch)  # Bottom transistor (input B)
-    rp = _R(sch)  # Pull-up resistor
-
-    # Pull-up to collector node
-    rp.wire("2", q1, "C")      # R bottom → Q1 collector
-    q1.wire("E", q2, "C")      # Q1 emitter → Q2 collector
-    # Output at junction of rp-2 and q1-C (same net)
-    return {"out_r": rp, "out_pin": "2",
-            "a": q1, "b": q2,
-            "vcc_r": rp, "vcc_pin": "1",
-            "gnd_q": q2, "gnd_pin": "E"}
-
-
-def build_not(sch, label="NOT"):
-    """RTL inverter: single NPN + pull-up.
-    Returns dict with keys: out, inp, vcc, gnd."""
-    q = _Q(sch)
-    rp = _R(sch)
-    rp.wire("2", q, "C")
-    return {"out_r": rp, "out_pin": "2",
-            "inp": q, "inp_pin": "B",
-            "vcc_r": rp, "vcc_pin": "1",
-            "gnd_q": q, "gnd_pin": "E"}
-
-
-def build_and(sch):
-    """NAND + NOT = AND."""
-    nand = build_nand(sch)
-    inv = build_not(sch)
-    nand["out_r"].wire(nand["out_pin"], inv["inp"], inv["inp_pin"])
-    return {"out_r": inv["out_r"], "out_pin": inv["out_pin"],
-            "a": nand["a"], "b": nand["b"],
-            "vcc_r": nand["vcc_r"], "vcc_pin": nand["vcc_pin"],
-            "gnd_q": nand["gnd_q"], "gnd_pin": nand["gnd_pin"]}
-
-
-def build_or(sch):
-    """Parallel NPN pair + pull-up + inverter = OR (via NOR+NOT)."""
-    q1 = _Q(sch)  # Input A
-    q2 = _Q(sch)  # Input B (parallel)
-    rp = _R(sch)  # Pull-up
-    inv = build_not(sch)  # Inverter for NOR→OR
-
-    rp.wire("2", q1, "C")
-    q1.wire("C", q2, "C")      # Collectors tied
-    q1.wire("E", q2, "E")      # Emitters tied to GND
-    rp.wire("2", inv["inp"], inv["inp_pin"])
-
-    return {"out_r": inv["out_r"], "out_pin": inv["out_pin"],
-            "a": q1, "b": q2,
-            "vcc_r": rp, "vcc_pin": "1",
-            "gnd_q": q1, "gnd_pin": "E"}
-
-
-def build_xor(sch):
-    """XOR from four NAND gates:
-    NAND1 = NAND(A, B)
-    NAND2 = NAND(A, NAND1)
-    NAND3 = NAND(B, NAND1)
-    XOR   = NAND(NAND2, NAND3)
-    """
-    n1 = build_nand(sch)
-    n2 = build_nand(sch)
-    n3 = build_nand(sch)
-    n4 = build_nand(sch)
-
-    # NAND1 output → inputs of NAND2.b and NAND3.a
-    n1["out_r"].wire(n1["out_pin"], n2["b"], "B")
-    n1["out_r"].wire(n1["out_pin"], n3["a"], "B")
-
-    # NAND2 output → NAND4 input a
-    n2["out_r"].wire(n2["out_pin"], n4["a"], "B")
-    # NAND3 output → NAND4 input b
-    n3["out_r"].wire(n3["out_pin"], n4["b"], "B")
-
-    return {
-        "out_r": n4["out_r"], "out_pin": n4["out_pin"],
-        "a_nand1": n1["a"],  # Input A goes to n1.a AND n2.a
-        "a_nand2": n2["a"],
-        "b_nand1": n1["b"],  # Input B goes to n1.b AND n3.b
-        "b_nand3": n3["b"],
-    }
-
-
-# ── Half Adder ────────────────────────────────────────────────────────────
-
-def build_half_adder(sch):
-    """Sum = A XOR B,  Carry = A AND B (using transistor-level gates)."""
-    xor = build_xor(sch)
-    and_gate = build_and(sch)
-    return {
-        "sum": xor,
-        "carry": and_gate,
-    }
-
-
-# ── Full Adder ────────────────────────────────────────────────────────────
-
-def build_full_adder(sch):
-    """Full adder from two half-adders + OR gate."""
-    ha1 = build_half_adder(sch)  # A + B
-    ha2 = build_half_adder(sch)  # (A⊕B) + Cin
-    or_gate = build_or(sch)      # Cout = C1 | C2
-
-    # HA1.sum → HA2 input A
-    ha1["sum"]["out_r"].wire(ha1["sum"]["out_pin"], ha2["sum"]["a_nand1"], "B")
-    ha1["sum"]["out_r"].wire(ha1["sum"]["out_pin"], ha2["sum"]["a_nand2"], "B")
-    ha1["sum"]["out_r"].wire(ha1["sum"]["out_pin"], ha2["carry"]["a"], "B")
-
-    # HA1.carry → OR.a
-    ha1["carry"]["out_r"].wire(ha1["carry"]["out_pin"], or_gate["a"], "B")
-
-    # HA2.carry → OR.b
-    ha2["carry"]["out_r"].wire(ha2["carry"]["out_pin"], or_gate["b"], "B")
-
-    return {
-        "sum_r": ha2["sum"]["out_r"],
-        "sum_pin": ha2["sum"]["out_pin"],
-        "cout_r": or_gate["out_r"],
-        "cout_pin": or_gate["out_pin"],
-        # External inputs
-        "a_nand1": ha1["sum"]["a_nand1"],
-        "a_nand2": ha1["sum"]["a_nand2"],
-        "a_and": ha1["carry"]["a"],
-        "b_nand1": ha1["sum"]["b_nand1"],
-        "b_nand3": ha1["sum"]["b_nand3"],
-        "b_and": ha1["carry"]["b"],
-        "cin_nand1": ha2["sum"]["b_nand1"],
-        "cin_nand3": ha2["sum"]["b_nand3"],
-        "cin_and": ha2["carry"]["b"],
-    }
-
-
-# ── 4-bit Ripple-Carry Adder ─────────────────────────────────────────────
-
-def build_4bit_adder():
-    """Build a 4-bit ripple-carry adder and return (schematic, adders)."""
-    sch = _new_sch()
-    adders = []
-    for _ in range(4):
-        adders.append(build_full_adder(sch))
-
-    # Cascade carry: adder[i].cout → adder[i+1].cin
-    for i in range(3):
-        a = adders[i]
-        b = adders[i + 1]
-        a["cout_r"].wire(a["cout_pin"], b["cin_nand1"], "B")
-        a["cout_r"].wire(a["cout_pin"], b["cin_nand3"], "B")
-        a["cout_r"].wire(a["cout_pin"], b["cin_and"], "B")
-
-    sch.wire_up()
+    for idx in range(3):
+        _fanout(slices[idx].or_carry, (slices[idx + 1].xor_sum, 1), (slices[idx + 1].and_carry, 0))
+    slices[-1].or_carry.label_output("COUT")
     return sch
 
 
-# ── RISC-V ALU Slice (4-bit, ADD/SUB/AND/OR/XOR) ─────────────────────────
-# This traces a subset of a RISC-V ALU at the transistor level.
-# Operations: 000=ADD, 001=SUB, 010=AND, 011=OR, 100=XOR
-#
-# Architecture per bit:
-#   B' = B XOR sub_flag  (for 2's complement subtraction)
-#   add_result  = full_adder(A, B', Cin)
-#   and_result  = A AND B
-#   or_result   = A OR B
-#   xor_result  = A XOR B
-#   (MUX selects output based on ALU opcode – simplified with labels)
+def build_riscv_alu_slice() -> schematic.Schematic:
+    return build_4bit_alu()
 
-def build_riscv_alu_slice():
-    """Build a 4-bit RISC-V ALU slice."""
-    sch = _new_sch()
 
-    # --- B-input conditioning: B XOR sub_flag for each bit ---
-    b_xors = []
-    for _ in range(4):
-        b_xors.append(build_xor(sch))
+def _normalize_project_position(x: float, y: float,
+                                min_x: float, min_y: float,
+                                scale: float = 0.05,
+                                margin: float = 25.40) -> tuple[float, float]:
+    return _snap(margin + (x - min_x) * scale), _snap(margin + (y - min_y) * scale)
 
-    # --- Full adder chain ---
-    adders = []
-    for _ in range(4):
-        adders.append(build_full_adder(sch))
 
-    # Connect B' (conditioned) to adder B inputs
-    for i in range(4):
-        bx = b_xors[i]
-        fa = adders[i]
-        bx["out_r"].wire(bx["out_pin"], fa["b_nand1"], "B")
-        bx["out_r"].wire(bx["out_pin"], fa["b_nand3"], "B")
-        bx["out_r"].wire(bx["out_pin"], fa["b_and"], "B")
+def _canonical_net_names(project: dict) -> tuple[dict[str, str], dict[str, str]]:
+    input_names: dict[str, str] = {}
+    output_names: dict[str, str] = {}
+    for idx, input_data in enumerate(project.get("inputs", [])):
+        input_names[input_data["port"]["uuid"]] = f"IN{idx}"
+    for idx, output_data in enumerate(project.get("outputs", [])):
+        source_uuid = output_data["port"].get("connected_from")
+        if source_uuid:
+            output_names[source_uuid] = f"OUT{idx}"
+    return input_names, output_names
 
-    # Cascade carry
-    for i in range(3):
-        a = adders[i]
-        b = adders[i + 1]
-        a["cout_r"].wire(a["cout_pin"], b["cin_nand1"], "B")
-        a["cout_r"].wire(a["cout_pin"], b["cin_nand3"], "B")
-        a["cout_r"].wire(a["cout_pin"], b["cin_and"], "B")
 
-    # --- Bitwise AND gates ---
-    and_gates = [build_and(sch) for _ in range(4)]
+def export_project_to_low_level(project_path: str, output_path: str,
+                                backend: str = "kicad") -> schematic.Schematic:
+    project = json.loads(Path(project_path).read_text(encoding="utf-8"))
+    gate_positions = [(gate["x"], gate["y"]) for gate in project.get("gates", [])]
+    if gate_positions:
+        xs = [pos[0] for pos in gate_positions]
+        ys = [pos[1] for pos in gate_positions]
+        width_mm = (max(xs) - min(xs)) * 0.05 + 50.8
+        height_mm = (max(ys) - min(ys)) * 0.05 + 50.8
+        paper = _choose_paper(width_mm, height_mm)
+        min_x = min(xs)
+        min_y = min(ys)
+    else:
+        paper = "A4"
+        min_x = 0.0
+        min_y = 0.0
 
-    # --- Bitwise OR gates ---
-    or_gates = [build_or(sch) for _ in range(4)]
+    sch = _new_page_schematic(paper)
+    input_names, output_names = _canonical_net_names(project)
+    gate_map: dict[str, ExportGate] = {}
+    port_to_gate: dict[str, ExportGate] = {}
 
-    # --- Bitwise XOR gates ---
-    xor_gates = [build_xor(sch) for _ in range(4)]
+    for idx, gate_data in enumerate(project.get("gates", [])):
+        gate_type = gate_data.get("type", gate_data.get("gate_type", "AND"))
+        x, y = _normalize_project_position(gate_data["x"], gate_data["y"], min_x, min_y)
+        exported = _make_export_gate(sch, gate_type, x, y, f"G{idx}")
+        gate_map[gate_data["uuid"]] = exported
+        port_to_gate[gate_data["output"]["uuid"]] = exported
 
-    sch.wire_up()
+    for gate_data in project.get("gates", []):
+        exported = gate_map[gate_data["uuid"]]
+        for idx, input_port in enumerate(gate_data.get("input", [])):
+            if idx >= len(exported.inputs):
+                continue
+            target_chip, target_input = exported.inputs[idx]
+            source_uuid = input_port.get("connected_from")
+            if not source_uuid:
+                continue
+            if source_uuid in port_to_gate:
+                port_to_gate[source_uuid].output.wire_to(target_chip, target_input)
+            elif source_uuid in input_names:
+                target_chip.label_input(target_input, input_names[source_uuid])
+
+    for source_uuid, out_name in output_names.items():
+        if source_uuid in port_to_gate:
+            port_to_gate[source_uuid].output.label_output(out_name)
+
+    sch.save(output_path, backend=backend)
     return sch
 
 
-# ── Roundtrip test ────────────────────────────────────────────────────────
-
-def roundtrip_test(src_path: str):
-    """Read a .kicad_sch, re-save it, read again, compare component counts."""
+def roundtrip_test(src_path: str) -> bool:
     print(f"Roundtrip test: {src_path}")
     sch1 = schematic.Schematic.load(src_path)
     tmp = src_path.replace(".kicad_sch", "_rt.kicad_sch")
@@ -267,150 +462,29 @@ def roundtrip_test(src_path: str):
     n1 = len(sch1.instances)
     n2 = len(sch2.instances)
     ok = n1 == n2
-    print(f"  Original: {n1} components,  Roundtrip: {n2} components  → {'PASS' if ok else 'FAIL'}")
+    print(f"  Original: {n1} components, Roundtrip: {n2} components -> {'PASS' if ok else 'FAIL'}")
     return ok
 
 
-# ── CLI entry ─────────────────────────────────────────────────────────────
+def _export_pair(sch: schematic.Schematic, stem: str):
+    sch.save(f"{stem}.kicad_sch", backend="kicad")
+    sch.save(f"{stem}.sch", backend="eagle")
+    roundtrip_test(f"{stem}.kicad_sch")
+
 
 def main():
     target = sys.argv[1] if len(sys.argv) > 1 else "all"
 
     if target in ("adder", "all"):
         print("=== 4-bit Adder ===")
-        sch = build_4bit_adder()
-        sch.save("4bit_adder.kicad_sch", backend="kicad")
-        sch.save("4bit_adder.sch", backend="eagle")
-        roundtrip_test("4bit_adder.kicad_sch")
+        _export_pair(build_4bit_adder(), "4bit_adder")
 
-    if target in ("riscv", "all"):
-        print("\n=== RISC-V ALU Slice ===")
-        sch = build_riscv_alu_slice()
-        sch.save("riscv_alu.kicad_sch", backend="kicad")
-        sch.save("riscv_alu.sch", backend="eagle")
-        roundtrip_test("riscv_alu.kicad_sch")
+    if target in ("alu", "riscv", "all"):
+        print("\n=== 4-bit ALU ===")
+        _export_pair(build_4bit_alu(), "4bit_alu")
 
     print("\nDone.")
 
 
 if __name__ == "__main__":
     main()
-from taurus import schematic
-
-# Initialize the schematic
-sch = schematic.Schematic()
-sch.init_libraries("transistor-npn", "resistor-power")
-
-# Initialize device sets
-t_ds = sch.init_device_set("BJT_", "Q")
-sch.init_device(t_ds, "NPN")
-r_ds = sch.init_device_set("R_", "R")
-sch.init_device(r_ds, "RES")
-
-# Function to create a half-adder
-def create_half_adder(sch):
-    # NAND for carry (A AND B)
-    q1 = sch.add_instance("BJT_", "NPN", "Q")  # First transistor for NAND
-    q2 = sch.add_instance("BJT_", "NPN", "Q")  # Second transistor for NAND
-    r1 = sch.add_instance("R_", "RES", "R")    # Pull-up resistor for NAND
-    q3 = sch.add_instance("BJT_", "NPN", "Q")  # Inverter for NAND output
-    r2 = sch.add_instance("R_", "RES", "R")    # Pull-up for carry output
-
-    # XOR for sum (A XOR B) using NAND gates: (A NAND ~B) NAND (~A NAND B)
-    q4 = sch.add_instance("BJT_", "NPN", "Q")  # NAND for A
-    q5 = sch.add_instance("BJT_", "NPN", "Q")  # NAND for A
-    r3 = sch.add_instance("R_", "RES", "R")    # Pull-up
-    q6 = sch.add_instance("BJT_", "NPN", "Q")  # Inverter for ~A
-    r4 = sch.add_instance("R_", "RES", "R")    # Pull-up
-
-    q7 = sch.add_instance("BJT_", "NPN", "Q")  # NAND for B
-    q8 = sch.add_instance("BJT_", "NPN", "Q")  # NAND for B
-    r5 = sch.add_instance("R_", "RES", "R")    # Pull-up
-    q9 = sch.add_instance("BJT_", "NPN", "Q")  # Inverter for ~B
-    r6 = sch.add_instance("R_", "RES", "R")    # Pull-up
-
-    q10 = sch.add_instance("BJT_", "NPN", "Q") # Final NAND for XOR
-    q11 = sch.add_instance("BJT_", "NPN", "Q") # Final NAND for XOR
-    r7 = sch.add_instance("R_", "RES", "R")    # Pull-up for sum
-
-    # Wire NAND for carry (A AND B)
-    q1.wire("C", r1, "1")      # Q1 collector to pull-up
-    q1.wire("E", q2, "C")      # Q1 emitter to Q2 collector
-    q2.wire("E", q3, "B")      # NAND output to inverter base
-    q3.wire("C", r2, "1")      # Inverter collector to pull-up
-    r2.wire("2", q3, "E")      # Ground the emitter
-
-    # Wire XOR (A XOR B)
-    # A NAND ~B
-    q4.wire("C", r3, "1")      # NAND collector to pull-up
-    q4.wire("E", q5, "C")
-    q5.wire("E", q6, "B")      # NAND to inverter
-    q6.wire("C", r4, "1")      # ~B output
-    r4.wire("2", q6, "E")      # Ground
-
-    # ~A NAND B
-    q7.wire("C", r5, "1")
-    q7.wire("E", q8, "C")
-    q8.wire("E", q9, "B")
-    q9.wire("C", r6, "1")      # ~A output
-    r6.wire("2", q9, "E")      # Ground
-
-    # (A NAND ~B) NAND (~A NAND B)
-    q10.wire("C", r7, "1")
-    q10.wire("E", q11, "C")
-    q6.wire("C", q10, "B")     # ~B to final NAND
-    q9.wire("C", q11, "B")     # ~A to final NAND
-    r7.wire("2", q11, "E")     # Ground
-
-    return {
-        "carry": q3,  # Carry output (A AND B)
-        "sum": q10,   # Sum output (A XOR B)
-        "a": q1,      # Input A (base of Q1)
-        "b": q2       # Input B (base of Q2)
-    }
-
-# Function to create a full-adder
-def create_full_adder(sch):
-    # Two half-adders
-    ha1 = create_half_adder(sch)  # A + B
-    ha2 = create_half_adder(sch)  # (A + B) + Cin
-
-    # OR gate for carry-out with inverter
-    q_or1 = sch.add_instance("BJT_", "NPN", "Q")  # NOR transistor
-    r_or1 = sch.add_instance("R_", "RES", "R")    # Pull-up
-    q_or2 = sch.add_instance("BJT_", "NPN", "Q")  # Inverter
-    r_or2 = sch.add_instance("R_", "RES", "R")    # Pull-up for OR output
-
-    # Wire half-adders
-    ha1["sum"].wire("C", ha2["a"], "B")  # HA1 sum to HA2 input A
-
-    # Wire OR gate: (HA1.carry OR HA2.carry)
-    ha1["carry"].wire("C", q_or1, "B")  # HA1 carry to NOR
-    ha2["carry"].wire("C", q_or1, "B")  # HA2 carry to NOR
-    q_or1.wire("C", r_or1, "1")         # NOR output
-    r_or1.wire("2", q_or1, "E")         # Ground
-    r_or1.wire("2", q_or2, "B")         # NOR to inverter
-    q_or2.wire("C", r_or2, "1")         # OR output
-    r_or2.wire("2", q_or2, "E")         # Ground
-
-    return {
-        "sum": ha2["sum"],      # Final sum
-        "carry_out": q_or2,     # Final carry-out
-        "a": ha1["a"],          # Input A
-        "b": ha1["b"],          # Input B
-        "carry_in": ha2["b"]    # Carry-in
-    }
-
-# Create 4 full-adders for a 4-bit adder
-adders = []
-for i in range(4):
-    adder = create_full_adder(sch)
-    adders.append(adder)
-
-# Cascade the carry-out to carry-in
-for i in range(3):
-    adders[i]["carry_out"].wire("C", adders[i + 1]["carry_in"], "B")
-
-# Generate and save the schematic
-sch.wire_up()
-sch.save("4bit_adder.kicad_sch")

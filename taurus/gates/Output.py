@@ -1,7 +1,7 @@
 import pygame
-from gates.Ports import Port
-from utils.popup import Popup
-from utils.colors import COLORS
+from .Ports import Port
+from ..utils.popup import Popup
+from ..utils.colors import COLORS
 
 class Output:
     def __init__(self, x, y) -> None:

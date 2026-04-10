@@ -38,42 +38,15 @@ def cmd_export(args: list[str]):
     json_path = args[0]
     out_path = args[1]
     backend = args[2] if len(args) > 2 else "kicad"
-
     import json
-    from taurus import schematic
+    from tracer import export_project_to_low_level
 
     data = json.loads(Path(json_path).read_text(encoding="utf-8"))
-    sch = schematic.Schematic()
-    sch.init_libraries("transistor-npn", "resistor-power")
-
-    # Map simulator gate types to transistor-level building blocks
-    from tracer import build_and, build_or, build_xor, build_nand, build_not, _new_sch
-
     print(f"Project has {len(data.get('gates', []))} gates, "
           f"{len(data.get('inputs', []))} inputs, "
           f"{len(data.get('outputs', []))} outputs.")
     print(f"Exporting to {out_path} (backend={backend})")
-
-    # For direct export, create a simple schematic with component labels
-    sch = _new_sch()
-    gate_map = {
-        "AND": build_and,
-        "OR": build_or,
-        "XOR": build_xor,
-        "NAND": build_nand,
-        "NOT": build_not,
-    }
-
-    built = {}
-    for gate in data.get("gates", []):
-        gtype = gate.get("gate_type", "AND")
-        gid = gate.get("id")
-        builder = gate_map.get(gtype)
-        if builder:
-            built[gid] = builder(sch)
-
-    sch.wire_up()
-    sch.save(out_path, backend=backend)
+    export_project_to_low_level(json_path, out_path, backend=backend)
 
 
 def cmd_roundtrip(args: list[str]):

@@ -1,5 +1,5 @@
 import pygame
-from utils.colors import COLORS
+from .colors import COLORS
 
 class Popup:
     def __init__(self,x,y,screen,items) -> None:
