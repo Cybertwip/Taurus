@@ -143,9 +143,27 @@ def _build_gate_chip(sch: schematic.Schematic, gate_type: str,
         vcc_pin=spec["vcc"],
         gnd_pin=spec["gnd"],
     )
-    sch.label_pin(chip.instance, chip.vcc_pin, "+5V")
-    sch.label_pin(chip.instance, chip.gnd_pin, "GND")
     return chip
+
+
+def _connect_power_rails(chips: list[GateChip]):
+    """Create explicit +5V/GND rail connectivity for a slice of gates."""
+    if not chips:
+        return
+
+    ordered = sorted(chips, key=lambda c: (c.instance.component.y, c.instance.component.x))
+    for prev, curr in zip(ordered, ordered[1:]):
+        prev.instance.wire(prev.vcc_pin, curr.instance, curr.vcc_pin)
+        prev.instance.wire(prev.gnd_pin, curr.instance, curr.gnd_pin)
+
+    root = ordered[0]
+    return root
+
+
+def _label_power_root(root: GateChip, length: float = 5.08):
+    sch = root.instance.schematic
+    sch.label_pin(root.instance, root.vcc_pin, "+5V", length=length, label_type="global_output")
+    sch.label_pin(root.instance, root.gnd_pin, "GND", length=length, label_type="global_output")
 
 
 def _fanout(source: GateChip, *targets: tuple[GateChip, int]):
@@ -269,16 +287,17 @@ def _build_adder_slice(sch: schematic.Schematic, bit: int,
     xor_sum = _build_gate_chip(sch, "XOR", left + 49.53, top + 27.94)
     and_carry = _build_gate_chip(sch, "AND", left + 49.53, top + 50.80)
     or_carry = _build_gate_chip(sch, "OR", left + 49.53, top + 73.66)
+    _connect_power_rails([xor_ab, and_ab, xor_sum, and_carry, or_carry])
 
-    xor_ab.label_input(0, f"A{bit}", label_type="global_output", length=0.0)
-    xor_ab.label_input(1, f"B{bit}", label_type="global_output", length=0.0)
+    xor_ab.label_input(0, f"A{bit}", label_type="global_output", length=5.08)
+    xor_ab.label_input(1, f"B{bit}", label_type="global_output", length=5.08)
     and_ab.label_input(0, f"A{bit}")
     and_ab.label_input(1, f"B{bit}")
 
     _fanout(xor_ab, (xor_sum, 0), (and_carry, 1))
     and_ab.wire_to(or_carry, 0)
     and_carry.wire_to(or_carry, 1)
-    xor_sum.label_output(f"S{bit}", label_type="global_input", length=0.0)
+    xor_sum.label_output(f"S{bit}", label_type="global_input", length=5.08)
 
     return AdderSlice(xor_ab, and_ab, xor_sum, and_carry, or_carry)
 
@@ -292,13 +311,18 @@ def build_4bit_adder() -> schematic.Schematic:
     for bit in range(4):
         slices.append(_build_adder_slice(sch, bit, left + bit * step, top))
 
-    slices[0].xor_sum.label_input(1, "CIN", label_type="global_output", length=0.0)
+    for idx in range(3):
+        slices[idx].xor_ab.instance.wire(slices[idx].xor_ab.vcc_pin, slices[idx + 1].xor_ab.instance, slices[idx + 1].xor_ab.vcc_pin)
+        slices[idx].xor_ab.instance.wire(slices[idx].xor_ab.gnd_pin, slices[idx + 1].xor_ab.instance, slices[idx + 1].xor_ab.gnd_pin)
+    _label_power_root(slices[0].xor_ab, length=5.08)
+
+    slices[0].xor_sum.label_input(1, "CIN", label_type="global_output", length=5.08)
     slices[0].and_carry.label_input(0, "CIN")
 
     for idx in range(3):
         carry_source = slices[idx].or_carry
         _fanout(carry_source, (slices[idx + 1].xor_sum, 1), (slices[idx + 1].and_carry, 0))
-    slices[-1].or_carry.label_output("COUT", label_type="global_input", length=0.0)
+    slices[-1].or_carry.label_output("COUT", label_type="global_input", length=5.08)
     return sch
 
 
@@ -331,15 +355,23 @@ def _build_alu_slice(sch: schematic.Schematic, bit: int,
     mix_ab = _build_gate_chip(sch, "OR", left + 71.12, top + 218.44)
     mix_cd = _build_gate_chip(sch, "OR", left + 71.12, top + 233.68)
     out = _build_gate_chip(sch, "OR", left + 71.12, top + 259.08)
+    _connect_power_rails([
+        xor_ab, and_ab, or_ab,
+        xor_sum, and_carry, or_carry,
+        inv_op0, inv_op1,
+        dec_and, dec_or, dec_xor, dec_sum,
+        gate_and, gate_or, gate_xor, gate_sum,
+        mix_ab, mix_cd, out,
+    ])
 
-    xor_ab.label_input(0, f"A{bit}", label_type="global_output", length=0.0)
-    xor_ab.label_input(1, f"B{bit}", label_type="global_output", length=0.0)
+    xor_ab.label_input(0, f"A{bit}", label_type="global_output", length=5.08)
+    xor_ab.label_input(1, f"B{bit}", label_type="global_output", length=5.08)
     for chip in (and_ab, or_ab):
         chip.label_input(0, f"A{bit}")
         chip.label_input(1, f"B{bit}")
 
     op_label_type = "global_output" if bit == 0 else "label"
-    op_label_length = 0.0 if bit == 0 else 7.62
+    op_label_length = 5.08 if bit == 0 else 7.62
     inv_op0.label_input(0, "OP0", label_type=op_label_type, length=op_label_length)
     inv_op1.label_input(0, "OP1", label_type=op_label_type, length=op_label_length)
     dec_or.label_input (1, "OP0")
@@ -368,7 +400,7 @@ def _build_alu_slice(sch: schematic.Schematic, bit: int,
     gate_sum.wire_to(mix_cd, 1)
     mix_ab.wire_to(out, 0)
     mix_cd.wire_to(out, 1)
-    out.label_output(f"F{bit}", label_type="global_input", length=0.0)
+    out.label_output(f"F{bit}", label_type="global_input", length=5.08)
 
     return AluSlice(
         xor_ab, and_ab, or_ab,
@@ -389,12 +421,21 @@ def build_4bit_alu() -> schematic.Schematic:
     for bit in range(4):
         slices.append(_build_alu_slice(sch, bit, left + bit * step, top))
 
-    slices[0].xor_sum.label_input(1, "CIN", label_type="global_output", length=0.0)
+    for idx in range(3):
+        # Stitch power rails between neighboring slices.
+        slices[idx].xor_ab.instance.wire(slices[idx].xor_ab.vcc_pin, slices[idx + 1].xor_ab.instance, slices[idx + 1].xor_ab.vcc_pin)
+        slices[idx].xor_ab.instance.wire(slices[idx].xor_ab.gnd_pin, slices[idx + 1].xor_ab.instance, slices[idx + 1].xor_ab.gnd_pin)
+        # Explicitly chain ALU operation controls between slices.
+        slices[idx].inv_op0.instance.wire(slices[idx].inv_op0.input_pins[0], slices[idx + 1].inv_op0.instance, slices[idx + 1].inv_op0.input_pins[0])
+        slices[idx].inv_op1.instance.wire(slices[idx].inv_op1.input_pins[0], slices[idx + 1].inv_op1.instance, slices[idx + 1].inv_op1.input_pins[0])
+    _label_power_root(slices[0].xor_ab, length=5.08)
+
+    slices[0].xor_sum.label_input(1, "CIN", label_type="global_output", length=5.08)
     slices[0].and_carry.label_input(0, "CIN")
 
     for idx in range(3):
         _fanout(slices[idx].or_carry, (slices[idx + 1].xor_sum, 1), (slices[idx + 1].and_carry, 0))
-    slices[-1].or_carry.label_output("COUT", label_type="global_input", length=0.0)
+    slices[-1].or_carry.label_output("COUT", label_type="global_input", length=5.08)
     return sch
 
 
