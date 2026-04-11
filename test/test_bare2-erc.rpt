@@ -1,0 +1,11 @@
+ERC report (2026-04-10T19:25:06-0600, Encoding UTF8)
+
+***** Sheet /
+[unconnected_wire_endpoint]: Unconnected wire endpoint
+    ; warning
+    @(99.06 mm, 99.06 mm): Horizontal Wire, length 10.16 mm
+[label_dangling]: Label not connected to anything
+    ; error
+    @(109.22 mm, 99.06 mm): Label 'TEST'
+
+ ** ERC messages: 2  Errors 1  Warnings 1

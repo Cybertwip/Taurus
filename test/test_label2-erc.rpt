@@ -1,0 +1,20 @@
+ERC report (2026-04-10T19:22:12-0600, Encoding UTF8)
+
+***** Sheet /
+[pin_not_connected]: Pin not connected
+    ; error
+    @(52.07 mm, 50.80 mm): Symbol U3 Pin 1 [Input, Line]
+[pin_not_connected]: Pin not connected
+    ; error
+    @(52.07 mm, 55.88 mm): Symbol U3 Pin 2 [Input, Line]
+[pin_not_connected]: Pin not connected
+    ; error
+    @(67.31 mm, 43.18 mm): Symbol U3 Pin 5 [VCC, Power input, Line]
+[pin_not_connected]: Pin not connected
+    ; error
+    @(67.31 mm, 63.50 mm): Symbol U3 Pin 3 [GND, Power input, Line]
+[label_dangling]: Label not connected to anything
+    ; error
+    @(87.63 mm, 53.34 mm): Label 'S0'
+
+ ** ERC messages: 5  Errors 5  Warnings 0

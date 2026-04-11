@@ -31,11 +31,25 @@ class GateChip:
     vcc_pin: str
     gnd_pin: str
 
-    def label_input(self, index: int, net_name: str):
-        self.instance.schematic.label_pin(self.instance, self.input_pins[index], net_name)
+    def label_input(self, index: int, net_name: str,
+                    label_type: str = "label", length: float = 7.62):
+        self.instance.schematic.label_pin(
+            self.instance,
+            self.input_pins[index],
+            net_name,
+            length=length,
+            label_type=label_type,
+        )
 
-    def label_output(self, net_name: str):
-        self.instance.schematic.label_pin(self.instance, self.output_pin, net_name)
+    def label_output(self, net_name: str,
+                     label_type: str = "label", length: float = 7.62):
+        self.instance.schematic.label_pin(
+            self.instance,
+            self.output_pin,
+            net_name,
+            length=length,
+            label_type=label_type,
+        )
 
     def wire_to(self, target: "GateChip", target_input_index: int):
         self.instance.wire(self.output_pin, target.instance, target.input_pins[target_input_index])
@@ -256,15 +270,15 @@ def _build_adder_slice(sch: schematic.Schematic, bit: int,
     and_carry = _build_gate_chip(sch, "AND", left + 49.53, top + 50.80)
     or_carry = _build_gate_chip(sch, "OR", left + 49.53, top + 73.66)
 
-    xor_ab.label_input(0, f"A{bit}")
-    xor_ab.label_input(1, f"B{bit}")
+    xor_ab.label_input(0, f"A{bit}", label_type="global_output", length=0.0)
+    xor_ab.label_input(1, f"B{bit}", label_type="global_output", length=0.0)
     and_ab.label_input(0, f"A{bit}")
     and_ab.label_input(1, f"B{bit}")
 
     _fanout(xor_ab, (xor_sum, 0), (and_carry, 1))
     and_ab.wire_to(or_carry, 0)
     and_carry.wire_to(or_carry, 1)
-    xor_sum.label_output(f"S{bit}")
+    xor_sum.label_output(f"S{bit}", label_type="global_input", length=0.0)
 
     return AdderSlice(xor_ab, and_ab, xor_sum, and_carry, or_carry)
 
@@ -278,13 +292,13 @@ def build_4bit_adder() -> schematic.Schematic:
     for bit in range(4):
         slices.append(_build_adder_slice(sch, bit, left + bit * step, top))
 
-    slices[0].xor_sum.label_input(1, "CIN")
+    slices[0].xor_sum.label_input(1, "CIN", label_type="global_output", length=0.0)
     slices[0].and_carry.label_input(0, "CIN")
 
     for idx in range(3):
         carry_source = slices[idx].or_carry
         _fanout(carry_source, (slices[idx + 1].xor_sum, 1), (slices[idx + 1].and_carry, 0))
-    slices[-1].or_carry.label_output("COUT")
+    slices[-1].or_carry.label_output("COUT", label_type="global_input", length=0.0)
     return sch
 
 
@@ -308,34 +322,39 @@ def _build_alu_slice(sch: schematic.Schematic, bit: int,
     inv_op1 = _build_gate_chip(sch, "NOT", left + 71.12, top + 43.18)
     dec_and = _build_gate_chip(sch, "AND", left + 71.12, top + 66.04)
     dec_or = _build_gate_chip(sch, "AND", left + 71.12, top + 81.28)
-    dec_xor = _build_gate_chip(sch, "AND", left + 71.12, top + 101.60)
-    dec_sum = _build_gate_chip(sch, "AND", left + 71.12, top + 116.84)
+    dec_xor = _build_gate_chip(sch, "AND", left + 71.12, top + 104.14)
+    dec_sum = _build_gate_chip(sch, "AND", left + 71.12, top + 119.38)
     gate_and = _build_gate_chip(sch, "AND", left + 71.12, top + 142.24)
     gate_or = _build_gate_chip(sch, "AND", left + 71.12, top + 157.48)
-    gate_xor = _build_gate_chip(sch, "AND", left + 71.12, top + 177.80)
-    gate_sum = _build_gate_chip(sch, "AND", left + 71.12, top + 193.04)
+    gate_xor = _build_gate_chip(sch, "AND", left + 71.12, top + 180.34)
+    gate_sum = _build_gate_chip(sch, "AND", left + 71.12, top + 195.58)
     mix_ab = _build_gate_chip(sch, "OR", left + 71.12, top + 218.44)
     mix_cd = _build_gate_chip(sch, "OR", left + 71.12, top + 233.68)
     out = _build_gate_chip(sch, "OR", left + 71.12, top + 259.08)
 
-    for chip in (xor_ab, and_ab, or_ab):
+    xor_ab.label_input(0, f"A{bit}", label_type="global_output", length=0.0)
+    xor_ab.label_input(1, f"B{bit}", label_type="global_output", length=0.0)
+    for chip in (and_ab, or_ab):
         chip.label_input(0, f"A{bit}")
         chip.label_input(1, f"B{bit}")
 
-    inv_op0.label_input(0, "OP0")
-    inv_op1.label_input(0, "OP1")
-    dec_or.label_input(1, "OP0")
+    op_label_type = "global_output" if bit == 0 else "label"
+    op_label_length = 0.0 if bit == 0 else 7.62
+    inv_op0.label_input(0, "OP0", label_type=op_label_type, length=op_label_length)
+    inv_op1.label_input(0, "OP1", label_type=op_label_type, length=op_label_length)
+    dec_or.label_input (1, "OP0")
     dec_sum.label_input(1, "OP0")
     dec_xor.label_input(1, "OP1")
     dec_sum.label_input(0, "OP1")
 
     _fanout(xor_ab, (xor_sum, 0), (and_carry, 1), (gate_xor, 0))
     and_ab.wire_to(or_carry, 0)
+    and_ab.wire_to(gate_and, 0)
     or_ab.wire_to(gate_or, 0)
     xor_sum.wire_to(gate_sum, 0)
     and_carry.wire_to(or_carry, 1)
 
-    _fanout(inv_op0, (dec_and, 1), (dec_xor, 1))
+    _fanout(inv_op0, (dec_and, 1), (dec_xor, 0))
     _fanout(inv_op1, (dec_and, 0), (dec_or, 0))
 
     dec_and.wire_to(gate_and, 1)
@@ -349,7 +368,7 @@ def _build_alu_slice(sch: schematic.Schematic, bit: int,
     gate_sum.wire_to(mix_cd, 1)
     mix_ab.wire_to(out, 0)
     mix_cd.wire_to(out, 1)
-    out.label_output(f"F{bit}")
+    out.label_output(f"F{bit}", label_type="global_input", length=0.0)
 
     return AluSlice(
         xor_ab, and_ab, or_ab,
@@ -370,12 +389,12 @@ def build_4bit_alu() -> schematic.Schematic:
     for bit in range(4):
         slices.append(_build_alu_slice(sch, bit, left + bit * step, top))
 
-    slices[0].xor_sum.label_input(1, "CIN")
+    slices[0].xor_sum.label_input(1, "CIN", label_type="global_output", length=0.0)
     slices[0].and_carry.label_input(0, "CIN")
 
     for idx in range(3):
         _fanout(slices[idx].or_carry, (slices[idx + 1].xor_sum, 1), (slices[idx + 1].and_carry, 0))
-    slices[-1].or_carry.label_output("COUT")
+    slices[-1].or_carry.label_output("COUT", label_type="global_input", length=0.0)
     return sch
 
 
@@ -423,6 +442,7 @@ def export_project_to_low_level(project_path: str, output_path: str,
     input_names, output_names = _canonical_net_names(project)
     gate_map: dict[str, ExportGate] = {}
     port_to_gate: dict[str, ExportGate] = {}
+    seen_input_nets: set[str] = set()
 
     for idx, gate_data in enumerate(project.get("gates", [])):
         gate_type = gate_data.get("type", gate_data.get("gate_type", "AND"))
@@ -443,11 +463,21 @@ def export_project_to_low_level(project_path: str, output_path: str,
             if source_uuid in port_to_gate:
                 port_to_gate[source_uuid].output.wire_to(target_chip, target_input)
             elif source_uuid in input_names:
-                target_chip.label_input(target_input, input_names[source_uuid])
+                net_name = input_names[source_uuid]
+                if net_name in seen_input_nets:
+                    target_chip.label_input(target_input, net_name)
+                else:
+                    target_chip.label_input(target_input, net_name,
+                                            label_type="global_output", length=0.0)
+                    seen_input_nets.add(net_name)
 
     for source_uuid, out_name in output_names.items():
         if source_uuid in port_to_gate:
-            port_to_gate[source_uuid].output.label_output(out_name)
+            port_to_gate[source_uuid].output.label_output(
+                out_name,
+                label_type="global_input",
+                length=0.0,
+            )
 
     sch.save(output_path, backend=backend)
     return sch

@@ -1,0 +1,14 @@
+ERC report (2026-04-10T19:24:47-0600, Encoding UTF8)
+
+***** Sheet /
+[endpoint_off_grid]: Symbol pin or wire end off connection grid
+    ; warning
+    @(100.00 mm, 100.00 mm): Horizontal Wire, length 10.00 mm
+[unconnected_wire_endpoint]: Unconnected wire endpoint
+    ; warning
+    @(100.00 mm, 100.00 mm): Horizontal Wire, length 10.00 mm
+[label_dangling]: Label not connected to anything
+    ; error
+    @(110.00 mm, 100.00 mm): Label 'TEST'
+
+ ** ERC messages: 3  Errors 1  Warnings 2

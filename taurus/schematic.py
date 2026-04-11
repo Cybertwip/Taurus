@@ -12,7 +12,7 @@ import math
 import os
 import uuid
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -262,6 +262,7 @@ class PinLabel:
     pin_name: str
     net_name: str
     length: float = 5.08
+    label_type: str = "label"  # "label", "global_input", "global_output"
 
 
 @dataclass
@@ -301,9 +302,13 @@ class Instance:
 
 
 # ---------------------------------------------------------------------------
-#  Routing engine
+#  Routing engine – MST + L-shape
 # ---------------------------------------------------------------------------
 class _Router:
+    """Route explicit wire connections using minimum-spanning-tree with
+    L-shaped (one-bend) segments.  No grid-based BFS – always succeeds."""
+    GRID_MM = 1.27
+
     def __init__(self, schematic: "Schematic"):
         self.sch = schematic
         self.nets: List[Tuple[str, Set[Tuple[str, str]]]] = []
@@ -315,6 +320,7 @@ class _Router:
         self._build_nets()
         self._route()
 
+    # -- net discovery -------------------------------------------------------
     def _build_nets(self):
         uf = UnionFind()
         nodes: Set[Tuple[str, str]] = set()
@@ -332,6 +338,7 @@ class _Router:
         for idx, members in enumerate(sorted(sorted(g) for g in groups.values()), 1):
             self.nets.append((f"N{idx}", set(members)))
 
+    # -- pin helpers ---------------------------------------------------------
     def _pin_pos(self, ref: str, pin: str) -> Tuple[float, float]:
         comp = self.sch.parts[ref]
         spec = comp.device_set.symbol_spec
@@ -344,65 +351,194 @@ class _Router:
         spec = comp.device_set.symbol_spec
         return (spec.pin_orientations[pin] + comp.rotation) % 360
 
+    # -- routing core --------------------------------------------------------
+    @staticmethod
+    def _label_geo(dx: float, dy: float) -> Tuple[int, str]:
+        """Label rotation & justification for a given outward direction."""
+        if dx > 0:
+            return 180, "right bottom"
+        if dx < 0:
+            return 0, "left bottom"
+        if dy < 0:
+            return 90, "left bottom"
+        return 270, "right bottom"
+
     def _route(self):
-        stub = 2.54
+        """Route nets using straight wires for aligned stubs, labels for the rest.
+
+        *Aligned* means every pin's stub endpoint shares the same grid
+        column (or row).  A straight wire through that column connects them
+        directly.  When two aligned nets would occupy overlapping segments
+        of the same column the second one falls back to labels.
+
+        Non-aligned nets (stubs at different X *and* Y) always get labels
+        so no L-shaped wire ever crosses a component body.
+        """
+        STUB = 2.54
+        # Map of pins that already have a label_pin entry
+        labeled_pins: Dict[Tuple[str, str], str] = {
+            (pl.reference, pl.pin_name): pl.net_name
+            for pl in self.sch.pin_labels
+        }
+
+        # Phase 1: compute stubs and classify each net ----------------------
+        net_data: List[Tuple[str, List[Tuple[str, str, float, float,
+                                             float, float, float, float]],
+                             Optional[str], str]] = []
         for net_name, members in self.nets:
-            member_list = sorted(members)
-            if len(member_list) == 2:
-                a, b = member_list
-                ax, ay = self._pin_pos(*a)
-                bx, by = self._pin_pos(*b)
-                ao, bo = self._pin_orient(*a), self._pin_orient(*b)
-                adx, ady = _outward(ao)
-                bdx, bdy = _outward(bo)
-                aex, aey = ax + adx * stub, ay + ady * stub
-                bex, bey = bx + bdx * stub, by + bdy * stub
-                dist = abs(aex - bex) + abs(aey - bey)
-                if dist < 150:
-                    self.wires.append((ax, ay, aex, aey))
-                    self.wires.append((bx, by, bex, bey))
-                    mx = (aex + bex) / 2.0
-                    # route: stub-a → mid-x → mid-y → stub-b
-                    self.wires.append((aex, aey, mx, aey))
-                    self.wires.append((mx, aey, mx, bey))
-                    self.wires.append((mx, bey, bex, bey))
-                    continue
-
-            if 3 <= len(member_list) <= 5:
-                endpoints = []
-                for ref, pin in member_list:
-                    px, py = self._pin_pos(ref, pin)
-                    orient = self._pin_orient(ref, pin)
-                    dx, dy = _outward(orient)
-                    sx, sy = px + dx * stub, py + dy * stub
-                    endpoints.append((ref, pin, px, py, sx, sy, dx, dy))
-
-                source = next((ep for ep in endpoints if ep[6] > 0.5), None)
-                if source is None:
-                    source = min(endpoints, key=lambda ep: ep[4])
-                others = [ep for ep in endpoints if ep is not source]
-                if others:
-                    trunk_x = _snap((source[4] + sum(ep[4] for ep in others) / len(others)) / 2.0)
-                    ys = [ep[5] for ep in endpoints]
-                    top_y = min(ys)
-                    bottom_y = max(ys)
-
-                    for _, _, px, py, sx, sy, _, _ in endpoints:
-                        self.wires.append((px, py, sx, sy))
-                        self.wires.append((sx, sy, trunk_x, sy))
-                        self.junctions.add((_snap(trunk_x), _snap(sy)))
-
-                    if top_y != bottom_y:
-                        self.wires.append((trunk_x, top_y, trunk_x, bottom_y))
-                    continue
-
-            # Fallback: net labels for multi-pin nets or long distances
-            for ref, pin in member_list:
+            ml = sorted(members)
+            if len(ml) < 2:
+                continue
+            pins: List[Tuple[str, str, float, float,
+                             float, float, float, float]] = []
+            for ref, pin in ml:
                 px, py = self._pin_pos(ref, pin)
                 orient = self._pin_orient(ref, pin)
-                lx, ly, rot, jst = _pin_label_geometry(px, py, orient, stub)
-                self.wires.append((px, py, lx, ly))
-                self.labels.append((net_name, lx, ly, rot, jst))
+                dx, dy = _outward(orient)
+                sx = _snap(px + dx * STUB)
+                sy = _snap(py + dy * STUB)
+                pins.append((ref, pin, px, py, sx, sy, dx, dy))
+
+            stub_xs = set(round(p[4], 2) for p in pins)
+            stub_ys = set(round(p[5], 2) for p in pins)
+            if len(stub_xs) == 1:
+                axis: Optional[str] = "x"
+            elif len(stub_ys) == 1:
+                axis = "y"
+            else:
+                axis = None
+
+            # Pick a label name: reuse an existing label_pin name when one
+            # of this net's pins already carries one; otherwise auto-name.
+            lbl_name = net_name
+            for ref, pin, *_ in pins:
+                existing = labeled_pins.get((ref, pin))
+                if existing:
+                    lbl_name = existing
+                    break
+
+            net_data.append((net_name, pins, axis, lbl_name))
+
+        # Phase 2: route aligned nets (more pins first, shorter span) ------
+        aligned = [d for d in net_data if d[2] is not None]
+        others  = [d for d in net_data if d[2] is None]
+
+        def _perp(pins, axis):
+            return ([p[5] for p in pins] if axis == "x"
+                    else [p[4] for p in pins])
+
+        aligned.sort(key=lambda d: (-len(d[1]),
+                                    max(_perp(d[1], d[2])) - min(_perp(d[1], d[2]))))
+
+        # Track occupied channel segments: (axis, axis_val) → [(min, max)]
+        occupied: Dict[Tuple[str, float], List[Tuple[float, float]]] = defaultdict(list)
+        # Track backbone wire segments for cross-net collision detection:
+        # list of (x1, y1, x2, y2) for backbone wires only (not stubs)
+        backbone_segs: List[Tuple[float, float, float, float]] = []
+
+        for net_name, pins, axis, lbl_name in aligned:
+            val_idx = 4 if axis == "x" else 5      # sx or sy (shared)
+            perp_idx = 5 if axis == "x" else 4      # sy or sx (varies)
+            axis_val = round(pins[0][val_idx], 2)
+            perps = [p[perp_idx] for p in pins]
+            seg_min, seg_max = min(perps), max(perps)
+
+            key = (axis, axis_val)
+            conflict = any(seg_min < exmax and seg_max > exmin
+                           for exmin, exmax in occupied[key])
+            if not conflict:
+                # Emit stub wires (pin → stub endpoint)
+                for _ref, _pin, px, py, sx, sy, _dx, _dy in pins:
+                    if (px, py) != (sx, sy):
+                        self.wires.append((px, py, sx, sy))
+                # Emit backbone as separate segments between consecutive
+                # stub endpoints.  KiCad junctions on a monolithic wire's
+                # interior break endpoint connectivity at the far end;
+                # pre-splitting avoids this.
+                sorted_pins = sorted(pins, key=lambda p: p[perp_idx])
+                first_shared = sorted_pins[0][val_idx]
+                for i in range(len(sorted_pins) - 1):
+                    p_a = sorted_pins[i][perp_idx]
+                    p_b = sorted_pins[i + 1][perp_idx]
+                    if abs(p_a - p_b) < 0.001:
+                        continue
+                    if axis == "x":
+                        seg = (first_shared, p_a,
+                               first_shared, p_b)
+                    else:
+                        seg = (p_a, first_shared,
+                               p_b, first_shared)
+                    self.wires.append(seg)
+                    backbone_segs.append(seg)
+                # Junctions at interior stub endpoints (visual only now,
+                # connectivity is already established by shared endpoints)
+                for p in sorted_pins[1:-1]:
+                    self.junctions.add((p[4], p[5]))
+
+                occupied[key].append((seg_min, seg_max))
+            else:
+                self._emit_net_labels(lbl_name, pins, labeled_pins,
+                                      backbone_segs)
+
+        # Phase 3: non-aligned nets → labels --------------------------------
+        for net_name, pins, _axis, lbl_name in others:
+            self._emit_net_labels(lbl_name, pins, labeled_pins,
+                                  backbone_segs)
+
+    def _emit_net_labels(self, lbl_name: str,
+                         pins: List[Tuple[str, str, float, float,
+                                          float, float, float, float]],
+                         labeled_pins: Dict[Tuple[str, str], str],
+                         backbone_segs: List[Tuple[float, float, float, float]]):
+        """Emit a stub wire + net label for each pin in the net.
+
+        If a pin already has a ``label_pin`` entry with a matching name,
+        the label is skipped (the pin_label system will place it).
+
+        If a stub endpoint would land on the interior of an existing
+        backbone wire, the stub is omitted and the label is placed
+        directly at the pin position to avoid creating a cross-net
+        T-junction.
+        """
+        for ref, pin, px, py, sx, sy, dx, dy in pins:
+            # Check if stub endpoint would T-junction on a backbone
+            skip_stub = False
+            if (px, py) != (sx, sy):
+                if self._point_on_backbone_interior(sx, sy, backbone_segs):
+                    skip_stub = True
+
+            if not skip_stub and (px, py) != (sx, sy):
+                self.wires.append((px, py, sx, sy))
+
+            existing = labeled_pins.get((ref, pin))
+            if existing == lbl_name:
+                continue  # label_pin will handle this pin
+            rot, jst = self._label_geo(dx, dy)
+            if skip_stub:
+                # Place label at pin position instead of stub endpoint
+                self.labels.append((lbl_name, px, py, rot, jst))
+            else:
+                self.labels.append((lbl_name, sx, sy, rot, jst))
+
+    @staticmethod
+    def _point_on_backbone_interior(x: float, y: float,
+                                     backbone_segs: List[Tuple[float, float, float, float]],
+                                     eps: float = 0.01) -> bool:
+        """Return True if (x, y) is strictly inside a backbone wire segment."""
+        for x1, y1, x2, y2 in backbone_segs:
+            if abs(x1 - x2) < eps:
+                # Vertical backbone at X = x1
+                if abs(x - x1) < eps:
+                    lo, hi = min(y1, y2), max(y1, y2)
+                    if lo + eps < y < hi - eps:
+                        return True
+            elif abs(y1 - y2) < eps:
+                # Horizontal backbone at Y = y1
+                if abs(y - y1) < eps:
+                    lo, hi = min(x1, x2), max(x1, x2)
+                    if lo + eps < x < hi - eps:
+                        return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -468,20 +604,252 @@ def _extract_sym_block(text: str, token: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+#  Embedded power symbol lib_symbols (KiCad 8 format)
+# ---------------------------------------------------------------------------
+_POWER_LIB_SYMS: Dict[str, List[str]] = {
+    "+5V": [
+        '\t\t(symbol "power:+5V"',
+        "\t\t\t(power)",
+        "\t\t\t(pin_numbers hide)",
+        "\t\t\t(pin_names (offset 0) hide)",
+        "\t\t\t(exclude_from_sim no)",
+        "\t\t\t(in_bom no)",
+        "\t\t\t(on_board yes)",
+        '\t\t\t(property "Reference" "#PWR" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(property "Value" "+5V" (at 0 -1.016 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27))))",
+        '\t\t\t(property "Footprint" "" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(property "Datasheet" "" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(property "Description" "" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(symbol "+5V_0_1"',
+        "\t\t\t\t(polyline",
+        "\t\t\t\t\t(pts (xy -0.762 1.27) (xy 0 2.54))",
+        "\t\t\t\t\t(stroke (width 0) (type default))",
+        "\t\t\t\t\t(fill (type none)))",
+        "\t\t\t\t(polyline",
+        "\t\t\t\t\t(pts (xy 0 0) (xy 0 2.54))",
+        "\t\t\t\t\t(stroke (width 0) (type default))",
+        "\t\t\t\t\t(fill (type none)))",
+        "\t\t\t\t(polyline",
+        "\t\t\t\t\t(pts (xy 0 2.54) (xy 0.762 1.27))",
+        "\t\t\t\t\t(stroke (width 0) (type default))",
+        "\t\t\t\t\t(fill (type none)))",
+        "\t\t\t)",
+        '\t\t\t(symbol "+5V_1_1"',
+        "\t\t\t\t(pin power_out line (at 0 0 90) (length 0)",
+        '\t\t\t\t\t(name "+5V" (effects (font (size 1.27 1.27))))',
+        '\t\t\t\t\t(number "1" (effects (font (size 1.27 1.27)))))',
+        "\t\t\t)",
+        "\t\t\t(embedded_fonts no)",
+        "\t\t)",
+    ],
+    "GND": [
+        '\t\t(symbol "power:GND"',
+        "\t\t\t(power)",
+        "\t\t\t(pin_numbers hide)",
+        "\t\t\t(pin_names (offset 0) hide)",
+        "\t\t\t(exclude_from_sim no)",
+        "\t\t\t(in_bom no)",
+        "\t\t\t(on_board yes)",
+        '\t\t\t(property "Reference" "#PWR" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(property "Value" "GND" (at 0 -1.27 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27))))",
+        '\t\t\t(property "Footprint" "" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(property "Datasheet" "" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(property "Description" "" (at 0 0 0)',
+        "\t\t\t\t(effects (font (size 1.27 1.27)) (hide yes)))",
+        '\t\t\t(symbol "GND_0_1"',
+        "\t\t\t\t(polyline",
+        "\t\t\t\t\t(pts (xy 0 0) (xy 0 -1.27) (xy 1.27 -1.27) (xy 0 -2.54) (xy -1.27 -1.27) (xy 0 -1.27))",
+        "\t\t\t\t\t(stroke (width 0) (type default))",
+        "\t\t\t\t\t(fill (type none)))",
+        "\t\t\t)",
+        '\t\t\t(symbol "GND_1_1"',
+        "\t\t\t\t(pin power_out line (at 0 0 270) (length 0)",
+        '\t\t\t\t\t(name "GND" (effects (font (size 1.27 1.27))))',
+        '\t\t\t\t\t(number "1" (effects (font (size 1.27 1.27)))))',
+        "\t\t\t)",
+        "\t\t\t(embedded_fonts no)",
+        "\t\t)",
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
 #  KiCad writer
 # ---------------------------------------------------------------------------
 class _KiCadWriter:
     def __init__(self, sch: "Schematic"):
         self.sch = sch
         self._sym_cache: Dict[str, str] = {}
+        self._power_positions: Dict[str, Tuple[float, float]] = {}
+
+    @staticmethod
+    def _grid_point(x: float, y: float) -> Tuple[int, int]:
+        return int(round(x / _Router.GRID_MM)), int(round(y / _Router.GRID_MM))
+
+    @staticmethod
+    def _edge_key(a: Tuple[int, int], b: Tuple[int, int]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        return (a, b) if a <= b else (b, a)
+
+    @staticmethod
+    def _iter_unit_nodes(a: Tuple[float, float], b: Tuple[float, float]) -> Iterable[Tuple[int, int]]:
+        ga = _KiCadWriter._grid_point(*a)
+        gb = _KiCadWriter._grid_point(*b)
+        if ga == gb:
+            return [ga]
+        if ga[0] == gb[0]:
+            step = 1 if gb[1] > ga[1] else -1
+            return [(ga[0], y) for y in range(ga[1], gb[1] + step, step)]
+        step = 1 if gb[0] > ga[0] else -1
+        return [(x, ga[1]) for x in range(ga[0], gb[0] + step, step)]
+
+    @staticmethod
+    def _iter_unit_edges(a: Tuple[float, float], b: Tuple[float, float]) -> Iterable[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        nodes = list(_KiCadWriter._iter_unit_nodes(a, b))
+        return [_KiCadWriter._edge_key(left, right) for left, right in zip(nodes, nodes[1:])]
+
+    @staticmethod
+    def _reserve_path(points: List[Tuple[float, float]],
+                      occupied_edges: Set[Tuple[Tuple[int, int], Tuple[int, int]]],
+                      occupied_nodes: Set[Tuple[int, int]]):
+        for a, b in zip(points, points[1:]):
+            occupied_edges.update(_KiCadWriter._iter_unit_edges(a, b))
+            occupied_nodes.update(_KiCadWriter._iter_unit_nodes(a, b))
+
+    @staticmethod
+    def _path_is_clear(points: List[Tuple[float, float]],
+                       occupied_edges: Set[Tuple[Tuple[int, int], Tuple[int, int]]],
+                       occupied_nodes: Set[Tuple[int, int]]) -> bool:
+        for segment_idx, (a, b) in enumerate(zip(points, points[1:])):
+            for edge in _KiCadWriter._iter_unit_edges(a, b):
+                if edge in occupied_edges:
+                    return False
+            nodes = list(_KiCadWriter._iter_unit_nodes(a, b))
+            node_slice = nodes[1:] if segment_idx == 0 else nodes
+            for node in node_slice:
+                if node in occupied_nodes:
+                    return False
+        return True
+
+    @staticmethod
+    def _label_style(dx: float, dy: float) -> Tuple[int, str]:
+        if dx > 0:
+            return 180, "right bottom"
+        if dx < 0:
+            return 0, "left bottom"
+        if dy < 0:
+            return 90, "left bottom"
+        return 270, "right bottom"
+
+    @staticmethod
+    def _dedupe_points(points: Iterable[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        deduped: List[Tuple[float, float]] = []
+        for x, y in points:
+            point = (_snap(x), _snap(y))
+            if deduped and deduped[-1] == point:
+                continue
+            deduped.append(point)
+        return deduped
+
+    def _pin_label_paths(self, x: float, y: float, orientation: int,
+                         length: float, net_name: str = "") -> List[Tuple[List[Tuple[float, float]], int, str]]:
+        dx, dy = _outward(orientation)
+        rot, jst = self._label_style(dx, dy)
+        end_x = x + dx * length
+        end_y = y + dy * length
+        candidates: List[List[Tuple[float, float]]] = []
+
+        escape = 2.54
+        default_detours = (5.08, -5.08, 10.16, -10.16)
+        if net_name == "+5V" and orientation in (90, 270):
+            detours = (-5.08, -10.16, 5.08, 10.16)
+        elif net_name == "GND" and orientation in (90, 270):
+            detours = (5.08, 10.16, -5.08, -10.16)
+        else:
+            candidates.append([(x, y), (end_x, end_y)])
+            detours = default_detours
+
+        for detour in detours:
+            if dx:
+                off_x, off_y = 0.0, detour
+            else:
+                off_x, off_y = detour, 0.0
+            candidates.append([
+                (x, y),
+                (x + off_x, y + off_y),
+                (end_x + off_x, end_y + off_y),
+            ])
+            candidates.append([
+                (x, y),
+                (x + dx * escape, y + dy * escape),
+                (x + dx * escape + off_x, y + dy * escape + off_y),
+                (end_x + off_x, end_y + off_y),
+            ])
+
+        if not candidates or candidates[0] != [(x, y), (end_x, end_y)]:
+            candidates.append([(x, y), (end_x, end_y)])
+
+        return [
+            (self._dedupe_points(points), rot, jst)
+            for points in candidates
+        ]
+
+    def _auto_paper(self, router: _Router) -> str:
+        """Pick the smallest standard paper that snugly contains all content."""
+        xs: List[float] = []
+        ys: List[float] = []
+        for comp in self.sch.parts.values():
+            spec = comp.device_set.symbol_spec
+            for pin_name in spec.pin_positions:
+                px, py = spec.pin_positions[pin_name]
+                rx, ry = _rot((px, py), comp.rotation)
+                xs.append(comp.x + rx)
+                ys.append(comp.y + ry)
+        for poly in self.sch.graphic_polylines:
+            for x, y in poly.points:
+                xs.append(x)
+                ys.append(y)
+        for text in self.sch.graphic_texts:
+            xs.append(text.x)
+            ys.append(text.y)
+        for x1, y1, x2, y2 in router.wires:
+            xs.extend([x1, x2])
+            ys.extend([y1, y2])
+        for pl in self.sch.pin_labels:
+            px, py = self.sch.pin_position(pl.reference, pl.pin_name)
+            orient = self.sch.pin_orientation(pl.reference, pl.pin_name)
+            dx, dy = _outward(orient)
+            xs.extend([px, px + dx * pl.length])
+            ys.extend([py, py + dy * pl.length])
+        if not xs:
+            return "A4"
+        margin = 15.0
+        need_w = max(xs) - min(min(xs), 0) + margin * 2
+        need_h = max(ys) - min(min(ys), 0) + margin * 2
+        for name, w, h in [("A4", 297, 210), ("A3", 420, 297),
+                           ("A2", 594, 420), ("A1", 841, 594)]:
+            if need_w <= w and need_h <= h:
+                return name
+        return "A1"
 
     def write(self, path: Path):
         proj = path.stem
         root = _uid(proj, "root")
+        router = _Router(self.sch)
+        router.run()
+        self.sch.paper = self._auto_paper(router)
         L = self._header(proj, root)
         L += self._lib_symbols()
         L += self._graphics(proj)
-        L += self._wires_and_labels(proj)
+        L += self._wires_and_labels(proj, router)
         L += self._symbols(proj, root)
         L += self._footer()
         path.write_text("\n".join(L) + "\n", encoding="utf-8")
@@ -511,23 +879,53 @@ class _KiCadWriter:
                 p = shared / "symbols" / spec.library_file
                 txt = p.read_text(encoding="utf-8")
                 block = _extract_sym_block(txt, f'(symbol "{spec.symbol_name}"')
-                # Only the top-level embedded symbol uses the library-qualified id.
-                # KiCad expects unit sub-symbols to keep their local names.
+                # Only the top-level symbol name gets the library prefix;
+                # subsymbol names (e.g. 74LVC1G08_0_1) keep their
+                # original un-prefixed names.
                 block = block.replace(
                     f'(symbol "{spec.symbol_name}"',
                     f'(symbol "{spec.library_id}"',
-                    1,
+                    1,  # first occurrence only — the parent symbol
                 )
                 self._sym_cache[spec.library_id] = block
             for ln in block.splitlines():
                 lines.append(f"\t\t{ln.lstrip()}" if ln.strip() else "")
+        # Add power symbol lib definitions for any +5V/GND nets
+        power_nets = {pl.net_name for pl in self.sch.pin_labels
+                      if pl.net_name in _POWER_LIB_SYMS}
+        for net in sorted(power_nets):
+            lines += _POWER_LIB_SYMS[net]
         lines.append("\t)")
         return lines
 
-    def _wires_and_labels(self, proj: str) -> List[str]:
-        router = _Router(self.sch)
-        router.run()
+    def _wires_and_labels(self, proj: str, router: _Router) -> List[str]:
         lines: List[str] = []
+
+        def _emit_label(name: str, x: float, y: float, rot: int, jst: str,
+                        uid: str, label_type: str = "label") -> List[str]:
+            if label_type in ("global_input", "global_output"):
+                shape = "input" if label_type == "global_input" else "output"
+                return [
+                    f'\t(global_label "{name}"',
+                    f"\t\t(shape {shape})",
+                    f"\t\t(at {_fc(x)} {_fc(y)} {rot})",
+                    "\t\t(fields_autoplaced yes)",
+                    "\t\t(effects (font (size 1.27 1.27))",
+                    f"\t\t\t(justify {jst}))",
+                    f'\t\t(uuid "{uid}")',
+                    "\t)",
+                ]
+            return [
+                f'\t(label "{name}"',
+                f"\t\t(at {_fc(x)} {_fc(y)} {rot})",
+                "\t\t(effects (font (size 1.27 1.27))",
+                f"\t\t\t(justify {jst}))",
+                f'\t\t(uuid "{uid}")',
+                "\t)",
+            ]
+
+        occupied_edges: Set[Tuple[Tuple[int, int], Tuple[int, int]]] = set()
+        occupied_nodes: Set[Tuple[int, int]] = set()
         for idx, (x1, y1, x2, y2) in enumerate(router.wires):
             wu = _uid(proj, "wire", idx)
             lines += [
@@ -539,16 +937,10 @@ class _KiCadWriter:
                 f'\t\t(uuid "{wu}")',
                 "\t)",
             ]
+            self._reserve_path([(x1, y1), (x2, y2)], occupied_edges, occupied_nodes)
         for idx, (name, lx, ly, rot, jst) in enumerate(router.labels):
             lu = _uid(proj, "label", idx)
-            lines += [
-                f'\t(label "{name}"',
-                f"\t\t(at {_fc(lx)} {_fc(ly)} {rot})",
-                "\t\t(effects (font (size 1.27 1.27))",
-                f"\t\t\t(justify {jst}))",
-                f'\t\t(uuid "{lu}")',
-                "\t)",
-            ]
+            lines += _emit_label(name, lx, ly, rot, jst, lu)
         for idx, (jx, jy) in enumerate(sorted(router.junctions)):
             ju = _uid(proj, "junction", idx)
             lines += [
@@ -562,24 +954,35 @@ class _KiCadWriter:
         for idx, pin_label in enumerate(self.sch.pin_labels):
             px, py = self.sch.pin_position(pin_label.reference, pin_label.pin_name)
             orient = self.sch.pin_orientation(pin_label.reference, pin_label.pin_name)
-            lx, ly, rot, jst = _pin_label_geometry(px, py, orient, pin_label.length)
-            wu = _uid(proj, pin_label.reference, pin_label.pin_name, "label-wire")
+            dx, dy = _outward(orient)
+
+            # Always start the label wire from the pin position.
+            # (Previously tried to skip the first stub when the grid edge
+            # was already occupied, but that false-triggered when an
+            # *unrelated* net's wire coincidentally shared the edge.)
+            lbl_x, lbl_y = px, py
+            lbl_length = pin_label.length
+
+            path, rot, jst = self._pin_label_paths(lbl_x, lbl_y, orient, lbl_length, pin_label.net_name)[0]
+            for candidate, cand_rot, cand_jst in self._pin_label_paths(lbl_x, lbl_y, orient, lbl_length, pin_label.net_name):
+                if self._path_is_clear(candidate, occupied_edges, occupied_nodes):
+                    path, rot, jst = candidate, cand_rot, cand_jst
+                    break
+            lx, ly = path[-1]
             lu = _uid(proj, pin_label.reference, pin_label.pin_name, "label")
-            lines += [
-                "\t(wire",
-                "\t\t(pts",
-                f"\t\t\t(xy {_fc(px)} {_fc(py)}) (xy {_fc(lx)} {_fc(ly)})",
-                "\t\t)",
-                "\t\t(stroke (width 0) (type solid))",
-                f'\t\t(uuid "{wu}")',
-                "\t)",
-                f'\t(label "{pin_label.net_name}"',
-                f"\t\t(at {_fc(lx)} {_fc(ly)} {rot})",
-                "\t\t(effects (font (size 1.27 1.27))",
-                f"\t\t\t(justify {jst}))",
-                f'\t\t(uuid "{lu}")',
-                "\t)",
-            ]
+            for seg_idx, (start, end) in enumerate(zip(path, path[1:])):
+                wu = _uid(proj, pin_label.reference, pin_label.pin_name, "label-wire", seg_idx)
+                lines += [
+                    "\t(wire",
+                    "\t\t(pts",
+                    f"\t\t\t(xy {_fc(start[0])} {_fc(start[1])}) (xy {_fc(end[0])} {_fc(end[1])})",
+                    "\t\t)",
+                    "\t\t(stroke (width 0) (type solid))",
+                    f'\t\t(uuid "{wu}")',
+                    "\t)",
+                ]
+            self._reserve_path(path, occupied_edges, occupied_nodes)
+            lines += _emit_label(pin_label.net_name, lx, ly, rot, jst, lu, pin_label.label_type)
         return lines
 
     def _graphics(self, proj: str) -> List[str]:
@@ -618,6 +1021,48 @@ class _KiCadWriter:
         lines: List[str] = []
         for inst in self.sch.instances:
             lines += self._one_sym(inst.component, proj, root)
+        lines += self._power_symbols(proj, root)
+        return lines
+
+    def _power_symbols(self, proj: str, root: str) -> List[str]:
+        lines: List[str] = []
+        power_nets = sorted({pl.net_name for pl in self.sch.pin_labels
+                             if pl.net_name in _POWER_LIB_SYMS})
+        for idx, net in enumerate(power_nets):
+            lib_id = f"power:{net}"
+            ref = f"#PWR{idx + 1}"
+            x = _snap(7.62 + idx * 12.70)
+            y = _snap(7.62)
+            su = _uid(proj, ref, "sym")
+            pu = _uid(proj, ref, "pin", "1")
+            lines += [
+                "\t(symbol",
+                f'\t\t(lib_id "{lib_id}")',
+                f"\t\t(at {_fc(x)} {_fc(y)} 0)",
+                "\t\t(unit 1)",
+                "\t\t(exclude_from_sim no)",
+                "\t\t(in_bom no)",
+                "\t\t(on_board yes)",
+                "\t\t(dnp no)",
+                f'\t\t(uuid "{su}")',
+            ]
+            lines += self._prop("Reference", ref, x, y, 0, True)
+            lines += self._prop("Value", net, x, y - 1.27, 0)
+            lines += self._prop("Footprint", "", x, y, 0, True)
+            lines += self._prop("Datasheet", "", x, y, 0, True)
+            lines += self._prop("Description", "", x, y, 0, True)
+            lines += [f'\t\t(pin "1"', f'\t\t\t(uuid "{pu}")', "\t\t)"]
+            lines += [
+                "\t\t(instances",
+                f'\t\t\t(project "{proj}"',
+                f'\t\t\t\t(path "/{root}"',
+                f'\t\t\t\t\t(reference "{ref}")',
+                "\t\t\t\t\t(unit 1)",
+                "\t\t\t\t)",
+                "\t\t\t)",
+                "\t\t)",
+                "\t)",
+            ]
         return lines
 
     def _one_sym(self, c: PlacedPart, proj: str, root: str) -> List[str]:
@@ -930,9 +1375,9 @@ class Schematic:
         return (spec.pin_orientations[pin_name] + comp.rotation) % 360
 
     def label_pin(self, instance_or_ref: Instance | str, pin_name: str,
-                  net_name: str, length: float = 7.62):
+                  net_name: str, length: float = 7.62, label_type: str = "label"):
         ref = instance_or_ref.component.reference if isinstance(instance_or_ref, Instance) else instance_or_ref
-        self.pin_labels.append(PinLabel(ref, pin_name, net_name, length))
+        self.pin_labels.append(PinLabel(ref, pin_name, net_name, length, label_type))
 
     def add_text(self, text: str, x: float, y: float, rotation: int = 0,
                  justify: str = "left bottom", size: float = 1.27):
